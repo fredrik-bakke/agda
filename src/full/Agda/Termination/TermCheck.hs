@@ -1,4 +1,3 @@
-{-# LANGUAGE GADTs                      #-}
 
 {-# LANGUAGE ImplicitParams             #-}
 {-# LANGUAGE NondecreasingIndentation   #-}
@@ -16,7 +15,7 @@ module Agda.Termination.TermCheck
     , Result
     ) where
 
-import Prelude hiding ( null )
+import Prelude hiding ( null, zip, zipWith )
 
 import Control.Applicative  ( liftA2 )
 import Control.Monad        ( (<=<), filterM, forM, forM_, zipWithM )
@@ -39,12 +38,11 @@ import Agda.Syntax.Translation.InternalToAbstract (NamedClause(..))
 import Agda.Termination.CutOff
 import Agda.Termination.Monad
 import Agda.Termination.CallGraph hiding (toList)
-import qualified Agda.Termination.CallGraph as CallGraph
+import Agda.Termination.CallGraph qualified as CallGraph
 import Agda.Termination.CallMatrix hiding (toList)
 import Agda.Termination.Order     as Order
-import qualified Agda.Termination.SparseMatrix as Matrix
-import Agda.Termination.Termination (endos, idempotent)
-import qualified Agda.Termination.Termination  as Term
+import Agda.Termination.SparseMatrix qualified as Matrix
+import Agda.Termination.Termination (Terminates(..), GuardednessHelps(..), idempotentEndos, terminatesFilter, terminationCounterexample)
 import Agda.Termination.RecCheck
 
 import Agda.TypeChecking.Datatypes
@@ -53,7 +51,7 @@ import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Forcing
 import Agda.TypeChecking.Records -- (isRecordConstructor, isInductiveRecord)
-import Agda.TypeChecking.Reduce (reduce, normalise, instantiate, instantiateFull, appDefE')
+import Agda.TypeChecking.Reduce (reduce, normalise, instantiate, instantiateFull, appDefE_)
 import Agda.TypeChecking.SizedTypes
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope
@@ -67,14 +65,18 @@ import Agda.Utils.Either
 import Agda.Utils.Function
 import Agda.Utils.Functor
 import Agda.Utils.List
+import Agda.Utils.ListInf ( pattern (:<) )
+import Agda.Utils.ListInf qualified as ListInf
 import Agda.Utils.Maybe
 import Agda.Utils.Monad -- (mapM', forM', ifM, or2M, and2M)
 import Agda.Utils.Null
 import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Utils.Singleton
 import Agda.Utils.Size
+-- import Agda.Utils.SmallSet (SmallSet)
 import qualified Agda.Utils.SmallSet as SmallSet
 import qualified Agda.Utils.VarSet as VarSet
+import Agda.Utils.Zip
 
 import Agda.Utils.Impossible
 
@@ -103,8 +105,8 @@ termDecl' = \case
     A.Axiom {}            -> return mempty
     A.Field {}            -> return mempty
     A.Primitive {}        -> return mempty
-    A.Mutual i ds         -> termMutual $ getNames ds
-    A.Section _ _ _ _ ds  -> termDecls ds
+    A.Mutual _ ds         -> termMutual $ getNames ds
+    A.Section _ _ _ _ ds  -> foldMap termDecl' ds
         -- section structure can be ignored as we are termination checking
         -- definitions lifted to the top-level
     A.Apply {}            -> return mempty
@@ -115,10 +117,10 @@ termDecl' = \case
     A.UnfoldingDecl{}     -> return mempty
     A.Generalize {}       -> return mempty
         -- open, pattern synonym and generalize defs are just artifacts from the concrete syntax
-    A.ScopedDecl scope ds -> {- withScope_ scope $ -} termDecls ds
+    A.ScopedDecl scope ds -> {- withScope_ scope $ -} foldMap termDecl' ds
         -- scope is irrelevant as we are termination checking Syntax.Internal
     A.RecSig{}            -> return mempty
-    A.RecDef _ x _ _ _ _ ds -> termMutual [x] <> termDecls ds
+    A.RecDef _ x _ _ _ _ _ _ ds -> termMutual [x] <> foldMap termDecl' ds
         -- Andreas, 2022-10-23, issue #5823
         -- Also check record types for termination.
         -- They are unfolded during construction of unique inhabitants of eta-records.
@@ -130,13 +132,12 @@ termDecl' = \case
     A.UnquoteDef{}  -> __IMPOSSIBLE__
     A.UnquoteData{} -> __IMPOSSIBLE__
   where
-    termDecls ds = concat <$> mapM termDecl' ds
-
     -- The mutual names mentioned in the abstract syntax
     -- for symbols that need to be termination-checked.
-    getNames = concatMap getName
+    getNames :: Foldable t => t A.Declaration -> [QName]
+    getNames = foldMap getName
     getName (A.FunDef i x cs)   = [x]
-    getName (A.RecDef _ x _ _ _ _ ds)   = x : getNames ds
+    getName (A.RecDef _ x _ _ _ _ _ _ ds) = x : getNames ds
     getName (A.Mutual _ ds)             = getNames ds
     getName (A.Section _ _ _ _ ds)      = getNames ds
     getName (A.ScopedDecl _ ds)         = getNames ds
@@ -158,7 +159,7 @@ termMutual names0 = ifNotM (optTerminationCheck <$> pragmaOptions) (return mempt
   -- Get set of mutually defined names from the TCM.
   -- This includes local and auxiliary functions introduced
   -- during type-checking.
-  mid <- fromMaybe __IMPOSSIBLE__ <$> asksTC envMutualBlock
+  mid <- fromMaybe __IMPOSSIBLE__ <$> viewTC eMutualBlock
   mutualBlock <- lookupMutualBlock mid
   let allNames = Set.filter (not . isAbsurdLambdaName) $
                  mutualNames mutualBlock
@@ -171,18 +172,18 @@ termMutual names0 = ifNotM (optTerminationCheck <$> pragmaOptions) (return mempt
   -- The following debug statement is part of a test case for Issue
   -- #3590.
   reportSLn "term.mutual.id" 40 $
-    "Termination checking mutual block " ++ show mid
+    "Termination checking mutual block " ++ prettyShow mid
   reportSLn "term.mutual" 10 $ "Termination checking " ++ prettyShow allNames
 
   -- NO_TERMINATION_CHECK
   if (Info.mutualTerminationCheck i `elem` [ NoTerminationCheck, Terminating ]) then do
       reportSLn "term.warn.yes" 10 $ "Skipping termination check for " ++ prettyShow names
-      forM_ allNames $ \ q -> setTerminates q True -- considered terminating!
+      forM_ allNames $ \ q -> setTerminates q $ Just True -- considered terminating!
       return mempty
   -- NON_TERMINATING
   else if (Info.mutualTerminationCheck i == NonTerminating) then do
       reportSLn "term.warn.yes" 10 $ "Considering as non-terminating: " ++ prettyShow names
-      forM_ allNames $ \ q -> setTerminates q False
+      forM_ allNames $ \ q -> setTerminates q $ Just False
       return mempty
   else do
     sccs <- do
@@ -191,7 +192,7 @@ termMutual names0 = ifNotM (optTerminationCheck <$> pragmaOptions) (return mempt
       ignoreAbstractMode $ do
         billTo [Benchmark.Termination, Benchmark.RecCheck] $ recursive allNames
       -- -- Andreas, 2017-03-24, use positivity info to skip non-recursive functions
-      -- skip = ignoreAbstractMode $ allM allNames $ \ x -> do
+      -- skip = ignoreAbstractMode $ forallM allNames $ \ x -> do
       --   null <$> getMutual x
       -- PROBLEMS with test/Succeed/AbstractCoinduction.agda
 
@@ -202,6 +203,10 @@ termMutual names0 = ifNotM (optTerminationCheck <$> pragmaOptions) (return mempt
     -- Actual termination checking needed: go through SCCs.
     concat <$> do
      forM sccs $ \ allNames -> do
+
+     -- Andreas, 2025-05-31, AIM XL, re issue #7906:
+     -- Clear previous information about termination to avoid loops in the termination checker.
+     forM_ allNames $ \ q -> setTerminates q Nothing
 
      -- Set the mutual names in the termination environment.
      let namesSCC = Set.filter (`Set.member` allNames) names
@@ -218,11 +223,45 @@ termMutual names0 = ifNotM (optTerminationCheck <$> pragmaOptions) (return mempt
      -- New check currently only makes a difference for copatterns and record types.
      -- Since it is slow, only invoke it if
      -- any of the definitions uses copatterns or is a record type.
-     ifM (anyM allNames $ \ q -> usesCopatterns q `or2M` (isJust <$> isRecord q))
+     ifM (existsM allNames $ \ q -> usesCopatterns q `or2M` (isJust <$> isRecord q))
          -- Then: New check, one after another.
          (runTerm $ forM' allNames $ termFunction)
          -- Else: Old check, all at once.
          (runTerm $ termMutual')
+
+-- | Run the termination checker.
+runTerminationCheck ::
+     (Node -> Bool)
+  -> TerM Calls
+  -> TerM (Terminates CallPath)
+runTerminationCheck filt collect = do
+    -- Use full precision when extracting calls
+    let ?cutoff = DontCutOff
+    calls <- collect
+
+    useGuardedness <- liftTCM guardednessOption
+    maxcutoff <- terGetCutOff
+    -- Iteratively increase cutoff up to its maximal value.
+    let
+      loop :: CutOff
+           -> Maybe (GuardednessHelps, CallPath)
+           -> TerM (Terminates CallPath)
+      loop cutoff currentResult = do
+        let ?cutoff = cutoff
+        reportCalls cutoff filt calls
+        r <- billToTerGraph $ terminatesFilter useGuardedness filt calls
+        case r of
+          Terminates -> return Terminates
+          TerminatesNot gh cinfo -> do
+            let result = bestResult currentResult (gh, cinfo)
+            if cutoff >= maxcutoff then return $ uncurry TerminatesNot result
+              else loop (cutoff + 1) (Just result)
+    loop 0 Nothing
+  where
+    bestResult :: Maybe (GuardednessHelps, CallPath) -> (GuardednessHelps, CallPath) -> (GuardednessHelps, CallPath)
+    bestResult Nothing r = r
+    bestResult (Just (GuardednessHelpsNot, _)) r@(GuardednessHelpsYes, _) = r
+    bestResult (Just r0) _ = r0
 
 -- | @termMutual'@ checks all names of the current mutual block,
 --   henceforth called @allNames@, for termination.
@@ -235,57 +274,33 @@ termMutual' = do
 
   -- collect all recursive calls in the block
   allNames <- terGetMutual
-  let collect = forM' allNames termDef
+  let collect :: TerM Calls
+      collect = forM' allNames termDef
 
-  -- first try to termination check ignoring the dot patterns
-  calls1 <- collect
-  reportCalls "no " calls1
-
-  cutoff <- terGetCutOff
-  let ?cutoff = cutoff
-  r <- billToTerGraph $ Term.terminates calls1
-  r <-
-       -- Andrea: 22/04/2020.
-       -- With cubical we will always have a clause where the dot
-       -- patterns are instead replaced with a variable, so they
-       -- cannot be relied on for termination.
-       -- See issue #4606 for a counterexample involving HITs.
-       --
-       -- Without the presence of HITs I conjecture that dot patterns
-       -- could be turned into actual splits, because no-confusion
-       -- would make the other cases impossible, so I do not disable
-       -- this for --without-K entirely.
-       ifM (isJust . optCubical <$> pragmaOptions) (return r) {- else -} $
-       case r of
-         r@Right{} -> return r
-         Left{}    -> do
-           -- Try again, but include the dot patterns this time.
-           calls2 <- terSetUseDotPatterns True $ collect
-           reportCalls "" calls2
-           billToTerGraph $ Term.terminates calls2
+  r <- runTerminationCheck (const True) collect
 
   -- @names@ is taken from the 'Abstract' syntax, so it contains only
   -- the names the user has declared.  This is for error reporting.
   names <- terGetUserNames
   case r of
 
-    Left calls -> do
-      mapM_ (`setTerminates` False) allNames
-      return $ singleton $ terminationError names calls
+    TerminatesNot guardednessHelps calls -> do
+      mapM_ (`setTerminates` Just False) allNames
+      return $ singleton $ terminationError names calls guardednessHelps
 
-    Right{} -> do
+    Terminates -> do
       liftTCM $ reportSLn "term.warn.yes" 2 $
         prettyShow (names) ++ " does termination check"
-      mapM_ (`setTerminates` True) allNames
+      mapM_ (`setTerminates` Just True) allNames
       return mempty
 
 -- | Smart constructor for 'TerminationError'.
 --   Removes 'termErrFunctions' that are not mentioned in 'termErrCalls'.
-terminationError :: Set QName -> CallPath -> TerminationError
-terminationError names calls = TerminationError names' calls'
+terminationError :: Set QName -> CallPath -> GuardednessHelps -> TerminationError
+terminationError names calls guardednessHelps = TerminationError names' calls' guardednessHelps
   where
   calls'    = callInfos calls
-  mentioned = map callInfoTarget calls'
+  mentioned = map' callInfoTarget calls'
   names'    = filter (hasElem mentioned) $ toList names
 
 billToTerGraph :: a -> TerM a
@@ -295,16 +310,17 @@ billToTerGraph a = liftTCM $ billPureTo [Benchmark.Termination, Benchmark.Graph]
 --
 --   Replays the call graph completion for debugging.
 
-reportCalls :: String -> Calls -> TerM ()
-reportCalls no calls = do
-  cutoff <- terGetCutOff
+reportCalls :: CutOff -> (Node -> Bool) -> Calls -> TerM ()
+reportCalls cutoff filt calls = do
+  useGuardedness <- liftTCM guardednessOption
   let ?cutoff = cutoff
 
   -- We work in TCM exclusively.
   liftTCM $ do
 
     reportS "term.lex" 20
-      [ "Calls (" ++ no ++ "dot patterns): " ++ prettyShow calls
+      [ "Termination depth: " ++ show cutoff
+      , "Calls: " ++ prettyShow calls
       ]
 
     -- Print the whole completion phase.
@@ -320,27 +336,30 @@ reportCalls no calls = do
                   k' = r - k
       let report s cs = reportSDoc "term.matrices" 40 $ vcat
             [ text   $ header s
-            , nest 2 $ pretty cs
+            , nest 2 $ prettyTCM cs
             ]
           cs0     = calls
           step cs = do
             let (new, cs') = completionStep cs0 cs
             report " New call matrices " new
-            return $ if null new then Left () else Right cs'
-      report " Initial call matrices " cs0
+            case terminationCounterexample useGuardedness filt new of
+              Terminates | not (null new) -> return $ Right cs'
+              _ -> return $ Left ()
+            -- return $ if null new then Left () else Right cs'
+      report (" Initial call matrices (cutoff: " ++ show cutoff ++ ") ") cs0
       trampolineM step cs0
 
     -- Print the result of completion.
     let calls' = CallGraph.complete calls
-        idems = filter idempotent $ endos $ CallGraph.toList calls'
+        idems = idempotentEndos calls'
     -- TODO
     -- reportSDoc "term.behaviours" 20 $ vcat
     --   [ text $ "Recursion behaviours (" ++ no ++ "dot patterns):"
     --   , nest 2 $ return $ Term.prettyBehaviour calls'
     --   ]
     reportSDoc "term.matrices" 30 $ vcat
-      [ text $ "Idempotent call matrices (" ++ no ++ "dot patterns):\n"
-      , nest 2 $ vcat $ punctuate "\n" $ map pretty idems
+      [ text $ "Idempotent call matrices:\n"
+      , nest 2 $ vcat $ punctuate "\n" $ map' prettyTCM idems
       ]
     -- reportSDoc "term.matrices" 30 $ vcat
     --   [ text $ "Other call matrices (" ++ no ++ "dot patterns):"
@@ -377,7 +396,10 @@ termFunction name = inConcreteOrAbstractMode name $ \ def -> do
     -- involve @name@,
     -- taking the target of @name@ into account for computing guardedness.
 
-    let collect = (`trampolineM` (Set.singleton index, mempty, mempty)) $ \ (todo, done, calls) -> do
+    let
+      collect :: TerM Calls
+      collect = -- strengthenLoopDiagonals <$> do  -- bad heuristics, see https://github.com/agda/agda/pull/8184#issuecomment-3487147737
+        (`trampolineM` (Set.singleton index, mempty, mempty)) $ \ (todo, done, calls) -> do
           if null todo then return $ Left calls else do
             -- Extract calls originating from indices in @todo@.
             new <- forM' todo $ \ i ->
@@ -393,41 +415,15 @@ termFunction name = inConcreteOrAbstractMode name $ \ def -> do
             -- Jump the trampoline.
             return $ Right (todo', done', calls')
 
-    -- First try to termination check ignoring the dot patterns
-    calls1 <- terSetUseDotPatterns False $ collect
-    reportCalls "no " calls1
-
-    r <- do
-     cutoff <- terGetCutOff
-     let ?cutoff = cutoff
-     r <- billToTerGraph $ Term.terminatesFilter (== index) calls1
-
-     -- Andrea: 22/04/2020.
-     -- With cubical we will always have a clause where the dot
-     -- patterns are instead replaced with a variable, so they
-     -- cannot be relied on for termination.
-     -- See issue #4606 for a counterexample involving HITs.
-     --
-     -- Without the presence of HITs I conjecture that dot patterns
-     -- could be turned into actual splits, because no-confusion
-     -- would make the other cases impossible, so I do not disable
-     -- this for --without-K entirely.
-     --
-     -- Andreas, 2022-03-21: The check for --cubical was missing here.
-     ifM (isJust . optCubical <$> pragmaOptions) (return r) {- else -} $ case r of
-       Right () -> return $ Right ()
-       Left{}   -> do
-         -- Try again, but include the dot patterns this time.
-         calls2 <- terSetUseDotPatterns True $ collect
-         reportCalls "" calls2
-         billToTerGraph $ Term.terminatesFilter (== index) calls2
+    r <- runTerminationCheck (== index) collect
 
     names <- terGetUserNames
-    case mapLeft callInfos r of
+    case r of
 
-      Left calls -> do
+      TerminatesNot guardednessHelps callpaths -> do
+        let calls = callInfos callpaths
         -- Mark as non-terminating.
-        setTerminates name False
+        setTerminates name $ Just False
 
         -- Functions must be terminating, records types need not...
         case theDef def of
@@ -436,18 +432,18 @@ termFunction name = inConcreteOrAbstractMode name $ \ def -> do
           Record{} -> do
             reportSDoc "term.warn.no" 10 $ vcat $
               hsep [ "Record type", prettyTCM name, "does not termination check.", "Problematic calls:" ] :
-              (map (nest 2 . prettyTCM) $ List.sortOn getRange calls)
+              map' (nest 2 . prettyTCM) (List.sortOn getRange calls)
             mempty
 
           -- Functions must terminate, so we report the error.
           _ -> do
-            let err = TerminationError [name | name `elem` names] calls
+            let err = TerminationError [name | name `elem` names] calls guardednessHelps
             return $ singleton err
 
-      Right () -> do
+      Terminates -> do
         reportSLn "term.warn.yes" 2 $
           prettyShow name ++ " does termination check"
-        setTerminates name True
+        setTerminates name $ Just True
         return mempty
    where
      reportTarget :: MonadDebug m => Target -> m ()
@@ -476,7 +472,8 @@ typeEndsInDef t = liftTCM $ do
 --   Only the latter depends on the choice whether we
 --   consider dot patterns or not.
 termDef :: QName -> TerM Calls
-termDef name = terSetCurrent name $ inConcreteOrAbstractMode name $ \ def -> do
+termDef name = terSetCurrent name $ inConcreteOrAbstractMode name \ def -> do
+  -- strengthenLoopDiagonals <$> do -- bad heuristics, see https://github.com/agda/agda/pull/8184#issuecomment-3487147737
 
  -- Skip calls to record types unless we are checking a record type in the first place.
  let isRecord_ = case theDef def of { Record{} -> True; _ -> False }
@@ -528,7 +525,7 @@ termDef name = terSetCurrent name $ inConcreteOrAbstractMode name $ \ def -> do
 termRecTel :: Nat -> Telescope -> TerM Calls
 termRecTel npars tel = do
   -- Set up the record parameters like function parameters.
-  let (pars, fields) = splitAt npars $ telToList tel
+  let (pars, fields) = splitAt' npars $ telToList tel
   addContext pars $ do
     ps <- mkPats npars
     terSetPatterns ps $ terSetSizeDepth pars $ do
@@ -536,8 +533,8 @@ termRecTel npars tel = do
       extract $ telFromList fields
   where
   -- create n variable patterns
-  mkPats n  = zipWith mkPat (downFrom n) <$> getContextNames
-  mkPat i x = notMasked $ VarP defaultPatternInfo $ DBPatVar (prettyShow x) i
+  mkPats n  = map' mkPat <$> getContextVars
+  mkPat (i, x) = notMasked $ VarP defaultPatternInfo $ DBPatVar (prettyShow x) i
 
 -- | Collect calls in type signature @f : (x1:A1)...(xn:An) -> B@.
 --   It is treated as if there were the additional function clauses.
@@ -565,8 +562,8 @@ termType = return mempty
         extract dom `mappend` underAbstractionAbs dom absB (loop $! n + 1)
 
   -- create n variable patterns
-  mkPats n  = zipWith mkPat (downFrom n) <$> getContextNames
-  mkPat i x = notMasked $ VarP defaultPatternInfo $ DBPatVar (prettyShow x) i
+  mkPats n  = map' mkPat <$> getContextVars
+  mkPat (i, x) = notMasked $ VarP defaultPatternInfo $ DBPatVar (prettyShow x) i
 
 -- | Mask arguments and result for termination checking
 --   according to type of function.
@@ -582,7 +579,7 @@ setMasks t cont = do
     when d $
       reportSLn "term.mask" 20 $ "result type is not data or record type, ignoring guardedness for --without-K"
     return (ds, d)
-  terSetMaskArgs (ds ++ repeat True) $ terSetMaskResult d $ cont
+  terSetMaskArgs (ListInf.pad ds True) $ terSetMaskResult d $ cont
 
   where
     checkArgumentTypes :: Telescope -> TCM [Bool]
@@ -606,15 +603,6 @@ targetElem ds = terGetTarget <&> \case
   TargetRecord -> False
   TargetOther  -> False
 
-
--- | Convert a term (from a dot pattern) to a DeBruijn pattern.
---
---   The term is first normalized and stripped of all non-coinductive projections.
-
-termToDBP :: Term -> TerM DeBruijnPattern
-termToDBP t =
-  termToPattern =<< do liftTCM $ stripAllProjections =<< normalise t
-
 -- | Convert a term (from a dot pattern) to a pattern for the purposes of the termination checker.
 --
 --   @SIZESUC@ is treated as a constructor.
@@ -629,32 +617,52 @@ instance TermToPattern a b => TermToPattern [a] [b] where
 instance TermToPattern a b => TermToPattern (Arg a) (Arg b) where
 instance TermToPattern a b => TermToPattern (Named c a) (Named c b) where
 
--- OVERLAPPING
--- instance TermToPattern a b => TermToPattern a (Named c b) where
---   termToPattern t = unnamed <$> termToPattern t
-
 instance TermToPattern Term DeBruijnPattern where
-  termToPattern t = liftTCM (constructorForm t) >>= \case
-    -- Constructors.
-    Con c _ args -> ifDotPatsOrRecord c $
-      ConP c noConPatternInfo . map (fmap unnamed) <$> termToPattern (fromMaybe __IMPOSSIBLE__ $ allApplyElims args)
-    Def s [Apply arg] -> ifDotPats $ do
-      suc <- terGetSizeSuc
-      if Just s == suc then ConP (ConHead s IsData Inductive []) noConPatternInfo . map (fmap unnamed) <$> termToPattern [arg]
-       else fallback
-    DontCare t  -> termToPattern t -- OR: __IMPOSSIBLE__  -- removed by stripAllProjections
-    -- Leaves.
-    Var i []    -> varP . (`DBPatVar` i) . prettyShow <$> nameOfBV i
-    Lit l       -> return $ litP l
-    Dummy s _   -> __IMPOSSIBLE_VERBOSE__ s
-    t           -> fallback
-    where
-    -- Andreas, 2022-06-14, issues #5953 and #4725
-    -- Recognize variable and record patterns in dot patterns regardless
-    -- of whether dot-pattern termination is on.
-    ifDotPats           = ifNotM terGetUseDotPatterns fallback
-    ifDotPatsOrRecord c = ifM (pure (IsData == conDataRecord c) `and2M` do not <$> terGetUseDotPatterns) fallback
-    fallback            = return $ dotP t
+  termToPattern t = do
+    t <- constructorForm =<< reduce t
+    let
+      -- Andrea: 22/04/2020.
+      -- With cubical we will always have a clause where the dot
+      -- patterns are instead replaced with a variable, so they
+      -- cannot be relied on for termination.
+      -- See issue #4606 for a counterexample involving HITs.
+      --
+      -- Without the presence of HITs I conjecture that dot patterns
+      -- could be turned into actual splits, because no-confusion
+      -- would make the other cases impossible, so I do not disable
+      -- this for --without-K entirely.
+      --
+      -- Szumi, 2025-03-11:
+      -- Instead of completely turning off dot-pattern termination for cubical,
+      -- it should be enough to only ignore constructors of HITs in dot patterns.
+      -- This way, the issues #5953 and #4725 are also avoided.
+      ifNotConsOfHIT :: ConHead -> TerM DeBruijnPattern -> TerM DeBruijnPattern
+      ifNotConsOfHIT c = ifM (consOfHIT (conName c)) fallback
+      -- Andreas, 2025-11-20, issue #8212
+      -- Reduce constructor to their original form
+      -- as this also happens in the call arguments.
+      fallback :: TerM DeBruijnPattern
+      fallback = dotP <$> do reduceCon t
+    case t of
+      -- Constructors.
+      Con c _ args -> ifNotConsOfHIT c $
+        ConP c noConPatternInfo . map' (fmap unnamed) <$> termToPattern (mustAllApplyElims args)
+      Def s [Apply arg] -> do
+        suc <- terGetSizeSuc
+        if Just s == suc then ConP (ConHead s IsData Inductive []) noConPatternInfo . map' (fmap unnamed) <$> termToPattern [arg]
+         else fallback
+      DontCare t  -> termToPattern t
+      -- Leaves.
+      -- Any (not coinductively) projected variable becomes a variable pattern.
+      Var i es -> case mapM isProjElim es of
+        Just oxs  -> foldMap (All <.> isProjectionButNotCoinductive . snd) oxs >>= \case
+          All True -> varP . (`DBPatVar` i) . prettyShow <$> nameOfBV i
+          _        -> fallback
+        _ -> fallback
+      Lit l       -> return $ litP l
+      Dummy s _   -> __IMPOSSIBLE_VERBOSE__ (show s)
+      _           -> fallback
+
 
 -- | Masks all non-data/record type patterns if --without-K.
 --   See issue #1023.
@@ -693,16 +701,18 @@ termClause clause = do
     -- Blank out coconstructors.
     ps <- preTraversePatternM stripCoCon ps
     -- Mask non-data arguments.
-    mdbpats <- maskNonDataArgs $ map namedArg ps
+    mdbpats <- maskNonDataArgs $ map' namedArg ps
     terSetPatterns mdbpats $ do
       terSetSizeDepth tel $ do
         reportBody v
         extract v
 
   where
+    parseDotP :: DeBruijnPattern -> TerM DeBruijnPattern
     parseDotP = \case
-      DotP o t -> termToDBP t
+      DotP o t -> termToPattern t
       p        -> return p
+    stripCoCon :: DeBruijnPattern -> TerM DeBruijnPattern
     stripCoCon = \case
       ConP (ConHead c _ CoInductive _) _ _ -> return unusedVar
       p -> return p
@@ -713,7 +723,7 @@ termClause clause = do
       liftTCM $ reportSDoc "term.check.clause" 6 $ do
         sep [ text ("termination checking clause of")
                 <+> prettyTCM f
-            , nest 2 $ "lhs:" <+> sep (map prettyTCM pats)
+            , nest 2 $ "lhs:" <+> sep (map' prettyTCM pats)
             , nest 2 $ "rhs:" <+> prettyTCM v
             ]
 
@@ -822,10 +832,10 @@ function g es0 = do
     -- If the function is a projection but not for a coinductive record,
     -- then preserve guardedness for its principal argument.
     isProj <- isProjectionButNotCoinductive g
-    let unguards = repeat Order.unknown
-    let guards = applyWhen isProj (guarded :) unguards
+    let unguards = ListInf.repeat Order.unknown
+    let guards = applyWhen isProj (guarded :<) unguards
     -- Collect calls in the arguments of this call.
-    let args = map unArg $ argsFromElims es0
+    let args = map' unArg $ argsFromElims es0
     calls <- forM' (zip guards args) $ \ (guard, a) -> do
       terSetGuarded guard $ extract a
 
@@ -931,30 +941,29 @@ function g es0 = do
          let src  = fromMaybe __IMPOSSIBLE__ $ Set.lookupIndex f names
              tgt  = gInd
              cm   = makeCM ncols nrows matrix'
-             info = CallPath $ singleton $
+             info = CallPath { callPathStart = f, callPathSteps = singleton $
                     CallInfo
                       { callInfoTarget = g
                       , callInfoCall   = doc
-                      }
+                      }}
          verboseS "term.kept.call" 5 $ do
            pats <- terGetPatterns
            reportSDoc "term.kept.call" 5 $ vcat
-             [ "kept call from" <+> text (prettyShow f) <+> hsep (map prettyTCM pats)
+             [ "kept call from" <+> text (prettyShow f) <+> hsep (map' prettyTCM pats)
              , nest 2 $ "to" <+> text (prettyShow g) <+>
-                         hsep (map (parens . prettyTCM) args)
+                         hsep (map' (parens . prettyTCM) args)
              , nest 2 $ "call matrix (with guardedness): "
              , nest 2 $ pretty cm
              ]
          return $ CallGraph.insert src tgt cm info calls
 
-  where
-    -- We have to reduce constructors in case they're reexported.
-    -- Andreas, Issue 1530: constructors have to be reduced deep inside terms,
-    -- thus, we need to use traverseTermM.
-    reduceCon :: Term -> TCM Term
-    reduceCon = traverseTermM $ \case
-      Con c ci vs -> (`applyE` vs) <$> reduce (Con c ci [])  -- make sure we don't reduce the arguments
-      t -> return t
+-- We have to reduce constructors in case they're reexported.
+-- Andreas, Issue 1530: constructors have to be reduced deep inside terms,
+-- thus, we need to use traverseTermM.
+reduceCon :: MonadTCM tcm => Term -> tcm Term
+reduceCon = liftTCM . traverseTermM \case
+  Con c ci vs -> (`applyE` vs) <$> reduce (Con c ci [])  -- make sure we don't reduce the arguments
+  t -> return t
 
 
 -- | Try to get rid of a function call targeting the current SCC
@@ -976,16 +985,18 @@ tryReduceNonRecursiveClause g es continue fallback = do
   ifM (notElem g <$> terGetMutual) fallback {-else-} $ do
   reportSLn "term.reduce" 40 $ "This call is in the current SCC!"
 
-  -- Then, collect its non-recursive clauses.
-  cls <- liftTCM $ getNonRecursiveClauses g
-  reportSLn "term.reduce" 40 $ unwords [ "Function has", show (length cls), "non-recursive exact clauses"]
-  reportSDoc "term.reduce" 80 $ vcat $ map (prettyTCM . NamedClause g True) cls
-  reportSLn  "term.reduce" 80 . ("allowed reductions = " ++) . show . SmallSet.elems
-    =<< asksTC envAllowedReductions
+  def <- getConstInfo g
+  -- -- Then, collect its clauses.
+  -- cls <- defClauses <$> getConstInfo g
+  -- reportSLn "term.reduce" 40 $ unwords [ "Function has", show (length cls), "clauses"]
+  -- reportSDoc "term.reduce" 80 $ vcat $ map (prettyTCM . NamedClause g True) cls
+  -- reportSLn  "term.reduce" 80 . ("allowed reductions = " ++) . show . SmallSet.elems
+  --   =<< asksTC envAllowedReductions
 
   -- Finally, try to reduce with the non-recursive clauses (and no rewrite rules).
-  r <- liftTCM $ modifyAllowedReductions (SmallSet.delete UnconfirmedReductions) $
-    runReduceM $ appDefE' g v0 cls [] (map notReduced es)
+  r <- liftTCM $
+    modifyAllowedReductions (SmallSet.delete UnconfirmedReductions) $
+    runReduceM $ appDefE_ g v0 (defClauses def) (defCompiled def) [] (map' notReduced es)
   case r of
     NoReduction{}    -> fallback
     YesReduction _ v -> do
@@ -995,13 +1006,6 @@ tryReduceNonRecursiveClause g es continue fallback = do
         ]
       verboseS "term.reduce" 5 $ tick "termination-checker-reduced-nonrecursive-call"
       continue v
-
-getNonRecursiveClauses :: QName -> TCM [Clause]
-getNonRecursiveClauses q =
-  filter (liftA2 (&&) nonrec exact) . defClauses <$> getConstInfo q
-  where
-  nonrec = maybe False not . clauseRecursive
-  exact  = fromMaybe False . clauseExact
 
 -- | Extract recursive calls from a term.
 
@@ -1015,11 +1019,12 @@ instance ExtractCalls Term where
 
       -- Constructed value.
       Con ConHead{conName = c, conDataRecord = dataOrRec} _ es -> do
-        let args = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
+        let args = mustAllApplyElims es
         -- A constructor preserves the guardedness of all its arguments.
         -- Andreas, 2022-09-19, issue #6108:
         -- A higher constructor does not.  So check if there is an @IApply@ amoung @es@.
-        let argsg = zip args $ repeat $ all isProperApplyElim es
+        let noIApply = all isProperApplyElim es
+        let argsg = map' (,noIApply) args
 
         -- If we encounter a coinductive record constructor
         -- in a type mutual with the current target
@@ -1034,10 +1039,10 @@ instance ExtractCalls Term where
           caseMaybeM (isRecordConstructor c) inductive $ \ (q, def) -> do
             reportSLn "term.check.term" 50 $ "constructor " ++ prettyShow c ++ " has record type " ++ prettyShow q
             -- inductive record constructors are not guarding
-            if recInduction def /= Just CoInductive then inductive else do
+            if _recInduction def /= Just CoInductive then inductive else do
             -- coinductive constructors unrelated to the mutually
             -- constructed inhabitants of coinductive types are not guarding
-            ifM (targetElem . fromMaybe __IMPOSSIBLE__ $ recMutual def)
+            ifM (targetElem . fromMaybe __IMPOSSIBLE__ $ _recMutual def)
                {-then-} coinductive
                {-else-} inductive
         constructor c ind argsg
@@ -1135,11 +1140,7 @@ compareArgs es = do
     filterM (isCoinductiveProjection True) $ mapMaybe (fmap snd . isProjElim) es
   cutoff <- terGetCutOff
   let ?cutoff = cutoff
-  useGuardedness <- liftTCM guardednessOption
-  let guardedness =
-        if useGuardedness
-        then decr True $ projsCaller - projsCallee
-        else Order.le
+  let guardedness = decr True $ projsCaller - projsCallee
   liftTCM $ reportSDoc "term.guardedness" 30 $ sep
     [ "compareArgs:"
     , nest 2 $ text $ "projsCaller = " ++ prettyShow projsCaller
@@ -1216,8 +1217,8 @@ compareProj d d'
           def <- theDef <$> getConstInfo r
           case def of
             Record{ recFields = fs } -> do
-              fs <- return $ map unDom fs
-              case (List.find (d==) fs, List.find (d'==) fs) of
+              fs <- return $ map' unDom fs
+              case (List.find (d ==) fs, List.find (d' ==) fs) of
                 (Just i, Just i')
                   -- earlier field is smaller
                   | i < i'    -> return Order.lt
@@ -1238,7 +1239,7 @@ makeCM ncols nrows matrix = CallMatrix $
 addGuardedness :: Order -> (Int, Int, [[Order]]) -> (Int, Int, [[Order]])
 addGuardedness o (nrows, ncols, m) =
   (nrows + 1, ncols + 1,
-   (o : replicate ncols Order.unknown) : map (Order.unknown :) m)
+   (o : replicate ncols Order.unknown) : map' (Order.unknown :) m)
 
 -- | Compose something with the upper-left corner of a call matrix
 composeGuardedness :: (?cutoff :: CutOff) => Order -> [[Order]] -> [[Order]]
@@ -1252,99 +1253,49 @@ offsetFromConstructor :: HasConstInfo tcm => QName -> tcm Int
 offsetFromConstructor c =
   ifM (isEtaOrCoinductiveRecordConstructor c) (return 0) (return 1)
 
---UNUSED Liang-Ting 2019-07-16
----- | Compute the proper subpatterns of a 'DeBruijnPattern'.
---subPatterns :: DeBruijnPattern -> [DeBruijnPattern]
---subPatterns = foldPattern $ \case
---  ConP _ _ ps -> map namedArg ps
---  DefP _ _ ps -> map namedArg ps -- TODO check semantics
---  VarP _ _    -> mempty
---  LitP _      -> mempty
---  DotP _ _    -> mempty
---  ProjP _ _   -> mempty
---  IApplyP{}   -> mempty
-
-
 compareTerm :: Term -> Masked DeBruijnPattern -> TerM Order
 compareTerm t p = do
 --   reportSDoc "term.compare" 25 $
 --     " comparing term " <+> prettyTCM t <+>
 --     " to pattern " <+> prettyTCM p
-  t <- liftTCM $ stripAllProjections t
-  o <- compareTerm' t p
+  o <- compareTerm' t =<< traverse reduceConPattern p
   liftTCM $ reportSDoc "term.compare" 25 $
     " comparing term " <+> prettyTCM t <+>
     " to pattern " <+> prettyTCM p <+>
     text (" results in " ++ prettyShow o)
   return o
 
-
--- | Remove all non-coinductive projections from an algebraic term
---   (not going under binders).
---   Also, remove 'DontCare's.
---
-class StripAllProjections a where
-  stripAllProjections :: a -> TCM a
-
-instance StripAllProjections a => StripAllProjections (Arg a) where
-  stripAllProjections = traverse stripAllProjections
-
-instance StripAllProjections Elims where
-  stripAllProjections es =
-    case es of
-      []             -> return []
-      (Apply a : es) -> do
-        (:) <$> (Apply <$> stripAllProjections a) <*> stripAllProjections es
-      (IApply x y a : es) -> do
-        -- TODO Andrea: are we doind extra work?
-        (:) <$> (IApply <$> stripAllProjections x
-                        <*> stripAllProjections y
-                        <*> stripAllProjections a)
-            <*> stripAllProjections es
-      (Proj o p  : es) -> do
-        isP <- isProjectionButNotCoinductive p
-        applyUnless isP (Proj o p :) <$> stripAllProjections es
-
-instance StripAllProjections Args where
-  stripAllProjections = mapM stripAllProjections
-
-instance StripAllProjections Term where
-  stripAllProjections t = do
-    case t of
-      Var i es   -> Var i <$> stripAllProjections es
-      Con c ci ts -> do
-        -- Andreas, 2019-02-23, re #2613.  This is apparently not necessary:
-        -- c <- fromRightM (\ err -> return c) $ getConForm (conName c)
-        Con c ci <$> stripAllProjections ts
-      Def d es   -> Def d <$> stripAllProjections es
-      DontCare t -> DontCare <$> stripAllProjections t
-      _ -> return t
-
 -- | Normalize outermost constructor name in a pattern.
 
-reduceConPattern :: DeBruijnPattern -> TCM DeBruijnPattern
+{-# SPECIALIZE reduceConPattern :: DeBruijnPattern -> TerM DeBruijnPattern #-}
+reduceConPattern :: MonadTCM tcm => DeBruijnPattern -> tcm DeBruijnPattern
 reduceConPattern = \case
-  ConP c i ps -> fromRightM (\ err -> return c) (getConForm (conName c)) <&> \ c' ->
+  ConP c i ps -> fromRightM (\ err -> return c) (liftTCM $ getConForm $ conName c) <&> \ c' ->
     ConP c' i ps
   p -> return p
 
 -- | @compareTerm' t dbpat@
+--
+-- Precondition: 'reduceConPattern' has been applied to the pattern.
 
 compareTerm' :: Term -> Masked DeBruijnPattern -> TerM Order
 compareTerm' v mp@(Masked m p) = do
   suc  <- terGetSizeSuc
   cutoff <- terGetCutOff
   let ?cutoff = cutoff
-  v <- liftTCM (instantiate v)
-  p <- liftTCM $ reduceConPattern p
+  -- v <- liftTCM (instantiate v) -- call extraction already instantiates metas in call arguments
+  let fallback = return $ subTerm v p
   case (v, p) of
 
     -- Andreas, 2013-11-20 do not drop projections,
     -- in any case not coinductive ones!:
-    (Var i es, _) | Just{} <- allApplyElims es ->
-      compareVar i mp
+    -- Andreas, 2025-11-05 we may drop all eliminations that are not coinductive projections.
+    (Var i es, _) -> foldMap (All <.> elimNotCoinductive) es >>= \case
+      All True -> compareVar i mp
+      _ -> fallback
 
-    (DontCare t, _) -> pure Order.unknown
+    (DontCare t, _) ->
+      compareTerm' t mp
 
     -- Andreas, 2014-09-22, issue 1281:
     -- For metas, termination checking should be optimistic.
@@ -1360,7 +1311,7 @@ compareTerm' v mp@(Masked m p) = do
     -- Successor on both sides cancel each other.
     -- We ignore the mask for sizes.
     (Def s [Apply t], ConP s' _ [p]) | s == conName s' && Just s == suc ->
-      compareTerm' (unArg t) (notMasked $ namedArg p)
+      compareTerm' (unArg t) . notMasked =<< reduceConPattern (namedArg p)
 
     -- Register also size increase.
     (Def s [Apply t], p) | Just s == suc ->
@@ -1388,7 +1339,7 @@ compareTerm' v mp@(Masked m p) = do
       decr True <$> offsetFromConstructor (conName c)
 
     (Con c _ es, ConP c' _ ps) | conName c == conName c'->
-      let ts = fromMaybe __IMPOSSIBLE__ $ allApplyElims es in
+      let ts = mustAllApplyElims es in
       compareConArgs ts ps
 
     (Con _ _ [], _) -> return Order.le
@@ -1396,21 +1347,21 @@ compareTerm' v mp@(Masked m p) = do
     -- new case for counting constructors / projections
     -- register also increase
     (Con c _ es, _) -> do
-      let ts = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
+      let ts = mustAllApplyElims es
       increase <$> offsetFromConstructor (conName c)
                <*> (infimum <$> mapM (\ t -> compareTerm' (unArg t) mp) ts)
 
-    (t, p) -> return $ subTerm t p
+    _ -> fallback
 
 -- | @subTerm@ computes a size difference (Order)
 subTerm :: (?cutoff :: CutOff) => Term -> DeBruijnPattern -> Order
 subTerm t p = if equal t p then Order.le else properSubTerm t p
   where
     equal (Con c _ es) (ConP c' _ ps) =
-      let ts = fromMaybe __IMPOSSIBLE__ $ allApplyElims es in
+      let ts = mustAllApplyElims es in
       and $ (conName c == conName c')
           : (length ts == length ps)
-          : zipWith (\ t p -> equal (unArg t) (namedArg p)) ts ps
+          : zipWith' (\ t p -> equal (unArg t) (namedArg p)) ts ps
     equal (Var i []) (VarP _ x) = i == dbPatVarIndex x
     equal (Lit l)    (LitP _ l') = l == l'
     -- Terms.
@@ -1421,7 +1372,7 @@ subTerm t p = if equal t p then Order.le else properSubTerm t p
     equal _ _ = False
 
     properSubTerm t (ConP _ _ ps) =
-      setUsability True $ decrease 1 $ supremum $ map (subTerm t . namedArg) ps
+      setUsability True $ decrease 1 $ supremum $ map' (subTerm t . namedArg) ps
     properSubTerm _ _ = Order.unknown
 
 isSubTerm :: (?cutoff :: CutOff) => Term -> DeBruijnPattern -> Bool
@@ -1442,7 +1393,7 @@ compareConArgs ts ps = do
     LT -> return Order.unknown
 
     EQ -> List.foldl' (Order..*.) Order.le <$>
-               zipWithM compareTerm' (map unArg ts) (map (notMasked . namedArg) ps)
+               zipWithM compareTerm' (map' unArg ts) (map' (notMasked . namedArg) ps)
        -- corresponds to taking the size, not the height
        -- allows examples like (x, y) < (Succ x, y)
 {- version which does an "order matrix"
@@ -1456,7 +1407,7 @@ compareConArgs ts ps = do
 -}
 {- version which takes height
 --    if null ts then Order.Le
---               else Order.infimum (zipWith compareTerm' (map unArg ts) ps)
+--               else Order.infimum (zipWith compareTerm' (map' unArg ts) ps)
 -}
 
 compareVar :: Nat -> Masked DeBruijnPattern -> TerM Order

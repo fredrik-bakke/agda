@@ -18,16 +18,17 @@ your own CSS file instead of the :download:`default, included one
 .. note::
 
   The :file:`Agda.css` shipped with Agda is located at
-  :file:`{${AGDA_DIR}}/html/Agda.css`.  Since version 2.6.2, the
-  :envvar:`AGDA_DIR` is printed by option :option:`--print-agda-dir`.
+  :file:`html/Agda.css` in the Agda data directory.
+  Since version 2.6.2, the
+  Agda data directory can be printed using the option
+  :option:`--print-agda-dir`, which has been an alias of
+  :option:`--print-agda-data-dir` since 2.6.4.1.
   Thus, you can get hold of the CSS file via
-  :samp:`cat $(agda --print-agda-dir)/html/Agda.css`.
+  :samp:`cat $(agda --print-agda-data-dir)/html/Agda.css`.
 
-You can also highlight all the occurrences of the symbol your mouse is
-hovering in the HTML by adding the ``--highlight-occurrences`` option.
-The default behaviour only highlight the single symbol your mouse is
-hovering. Note that this feature may cause browser performance problem,
-please enable it carefully (not recommended for huge files).
+You can also get highlighting for all occurrences of the symbol the mouse pointer is
+hovering over in the HTML by adding the :option:`--highlight-occurrences` option.
+The default behaviour is to only highlight the single symbol under the mouse pointer.
 
 If you're using Literate Agda with Markdown or reStructedText and you
 want to highlight your Agda codes with Agda's HTML backend and render
@@ -55,15 +56,36 @@ files, use ``--html-highlight=auto``, which means auto-detection.
 Options
 -------
 
-:samp:`--html-dir={directory}`
-  Changes the directory where the output is placed to
-  :samp:`{directory}`. Default: ``html``.
+:option:`--html`
 
-:samp:`--css={URL}`
-  The CSS_ file used by the HTML files (:samp:`{URL}` can be relative).
+  Generate HTML files with highlighted source code.
 
-:samp:`--html-highlight=[code,all,auto]`
-  Highlight Agda code only or everything in the generated HTML files.
-  Default: ``all``.
+.. option:: --html-dir={DIR}
+
+     Set directory in which HTML files are placed to ``DIR``
+     (default: ``html``).
+
+.. option:: --html-highlight=[code,all,auto]
+
+     .. versionadded:: 2.6.0
+
+     Whether to highlight non-Agda code as comments in generated HTML
+     files (default: ``all``).
+
+.. option:: --css={URL}
+
+     Set URL of the CSS_ file used by the HTML files to ``URL``
+     (can be relative).
+
+.. option:: --highlight-occurrences
+
+     .. versionadded:: 2.6.2
+
+     When :ref:`generating HTML <generating-html>`,
+     place the :file:`highlight-hover.js` script
+     in the output directory (see :option:`--html-dir`).
+     In the presence of the script,
+     hovering over an identifier in the rendering of the HTML
+     will highlight all occurrences of the same identifier on the page.
 
 .. _CSS:  https://www.w3.org/Style/CSS/

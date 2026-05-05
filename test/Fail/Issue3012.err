@@ -1,7 +1,12 @@
-Issue3012.agda:12,1-15
+Issue3012.agda:12.1-15: error: [CoverageIssue]
 Incomplete pattern matching for partial. Missing cases:
-  snd (partial x)
+  partial x .snd
 when checking the definition of partial
-Issue3012.agda:17,13-17
-partial x .snd != x of type A
+
+Issue3012.agda:17.13-17: error: [UnequalTerms]
+The terms
+  partial x .snd
+and
+  x
+are not equal at type A
 when checking that the expression refl has type partial x .snd ≡ x

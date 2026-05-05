@@ -2,8 +2,6 @@
 
 module Agda.TypeChecking.DropArgs where
 
-import Control.Arrow (second)
-
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
 
@@ -13,8 +11,9 @@ import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.CompiledClause
 import Agda.TypeChecking.Coverage.SplitTree
 
-import Agda.Utils.Functor
+import Agda.Utils.List
 import Agda.Utils.Permutation
+import Agda.Utils.Tuple (second)
 
 import Agda.Utils.Impossible
 
@@ -35,7 +34,7 @@ instance DropArgs Telescope where
   dropArgs n tel = telFromList $ drop n $ telToList tel
 
 instance DropArgs Permutation where
-  dropArgs n (Perm m p) = Perm (m - n) $ map (subtract n) $ drop n p
+  dropArgs n (Perm m p) = Perm (m - n) $! map' (subtract n) $ drop n p
 
 -- | NOTE: does not work for recursive functions.
 instance DropArgs Clause where
@@ -67,14 +66,17 @@ instance DropArgs Term where
 --   NOTE: this only works for non-recursive functions, we
 --   are not dropping arguments to recursive calls in bodies.
 instance DropArgs CompiledClauses where
-  dropArgs n cc = case cc of
-    Case i br | unArg i < n   -> __IMPOSSIBLE__
-              | otherwise     -> Case (i <&> \ j -> j - n) $ fmap (dropArgs n) br
-    Done xs t | length xs < n -> __IMPOSSIBLE__
-              | otherwise     -> Done (drop n xs) t
-    Fail xs   | length xs < n -> __IMPOSSIBLE__
-              | otherwise     -> Fail (drop n xs)
+  dropArgs n = \case
+    Case i br
+      | unArg i < n   -> __IMPOSSIBLE__
+      | otherwise     -> Case (i <&> \ j -> j - n) $ fmap (dropArgs n) br
+    Done no mr xs t
+      | length xs < n -> __IMPOSSIBLE__
+      | otherwise     -> Done no mr (drop n xs) t
+    Fail xs
+      | length xs < n -> __IMPOSSIBLE__
+      | otherwise     -> Fail (drop n xs)
 
 instance DropArgs SplitTree where
   dropArgs n (SplittingDone m) = SplittingDone (m - n)
-  dropArgs n (SplitAt i lz ts) = SplitAt (subtract n <$> i) lz $ map (second $ dropArgs n) ts
+  dropArgs n (SplitAt i lz ts) = SplitAt (subtract n <$> i) lz $ map' (second $ dropArgs n) ts

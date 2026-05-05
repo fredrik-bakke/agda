@@ -1,4 +1,5 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
+-- {-# OPTIONS_GHC -ddump-simpl -dsuppress-all -dno-suppress-type-signatures -ddump-to-file -dno-typeable-binds #-}
 
 {- | Checking for recursion:
 
@@ -36,8 +37,11 @@ import Agda.Syntax.Internal.Defs
 import Agda.Syntax.Common.Pretty  (prettyShow)
 
 import Agda.TypeChecking.Monad
+import Agda.TypeChecking.CompiledClause
 
+import Agda.Utils.List
 import Agda.Utils.Impossible
+import Agda.Utils.StrictFlipEndo
 
 -- | The mutual block we are checking.
 --
@@ -59,10 +63,10 @@ recursive :: Set QName -> TCM [MutualNames]
 recursive names = do
   let names' = toList names
   -- For each function, get names per clause and total.
-  (perClauses, nss) <- unzip <$> mapM (recDef (`Set.member` names)) names'
+  (perClauses, nss) <- unzip <$> mapM (recDef names) names'
   -- Create graph suitable for stronglyConnComp.
   -- Nodes are identical to node keys.
-  let graph  = zipWith (\ x ns -> (x, x, Set.toList ns)) names' nss
+  let graph  = zipWith' (\ x ns -> (x, x, Set.toList ns)) names' nss
   let sccs   = stronglyConnComp graph
   let nonRec = mapMaybe (\case AcyclicSCC x -> Just x
                                _            -> Nothing)
@@ -79,7 +83,7 @@ recursive names = do
   -- Mark individual clauses of recursive functions:
   --------------------------------------------------
   -- Map names to clause numbers to sets of mentioned names.
-  let clMap = Map.fromListWith __IMPOSSIBLE__ $ zip names' perClauses
+  let clMap = Map.fromListWith __IMPOSSIBLE__ $ zip' names' perClauses
   -- Walk through SCCs.
   forM_ recs $ \ scc -> do
     -- Does a set of names have an overlap with the current scc?
@@ -100,7 +104,8 @@ markNonRecursive :: QName -> TCM ()
 markNonRecursive q = modifySignature $ updateDefinition q $ updateTheDef $ \case
   def@Function{} -> def
    { funTerminates = Just True
-   , funClauses    = map (\ cl -> cl { clauseRecursive = Just False }) $ funClauses def
+   , funClauses    = map' (\ cl -> cl { clauseRecursive = NotRecursive }) $ funClauses def
+   , funCompiled   = fmap (mapDone \ done -> done{ ccClauseRecursive = NotRecursive }) $ funCompiled def
    }
   def@Record{} -> def
    { recTerminates = Just True
@@ -113,13 +118,14 @@ markRecursive
   -> QName -> TCM ()
 markRecursive f q = modifySignature $ updateDefinition q $ updateTheDef $ \case
   def@Function{} -> def
-   { funClauses    = zipWith (\ i cl -> cl { clauseRecursive = Just (f i) }) [0..] $ funClauses def
+   { funClauses    = zipWith' (\ i cl -> cl { clauseRecursive = decideRecursive (f i) }) [0..] $ funClauses def
+   , funCompiled   = fmap (mapDone \ done@CCDone{ ccClauseNumber = i } -> done{ ccClauseRecursive = decideRecursive (f i) }) $ funCompiled def
    }
   def -> def
 
 -- | @recDef names name@ returns all definitions from @names@
 --   that are used in the type and body of @name@.
-recDef :: (QName -> Bool) -> QName -> TCM (NamesPerClause, Set QName)
+recDef :: Set QName -> QName -> TCM (NamesPerClause, Set QName)
 recDef include name = do
   -- Retrieve definition
   def <- getConstInfo name
@@ -136,8 +142,14 @@ recDef include name = do
           (i,) <$> anyDefs include cl
       return (IntMap.fromList perClause, mconcat $ map snd perClause)
 
-    Record{ recTel } -> do
-      ns <- anyDefs include recTel
+    Datatype{ dataClause = Just cl } -> do
+      ns <- anyDefs include cl
+      return (IntMap.singleton 0 ns, ns)
+
+    Record{ recClause, recTel } -> do
+      ns1 <- anyDefs include recClause
+      ns2 <- anyDefs include recTel
+      let ns = ns1 `mappend` ns2
       return (IntMap.singleton 0 ns, ns)
 
     _ -> return (mempty, mempty)
@@ -149,21 +161,22 @@ recDef include name = do
     ]
   return (perClause, ns1 `mappend` ns2)
 
+{-# INLINE anyDefs #-}
 -- | @anysDef names a@ returns all definitions from @names@
 --   that are used in @a@.
-anyDefs :: GetDefs a => (QName -> Bool) -> a -> TCM (Set QName)
+anyDefs :: GetDefs a => Set QName -> a -> TCM (Set QName)
 anyDefs include a = do
   -- Prepare function to lookup metas outside of TCM
   st <- useR stSolvedMetaStore
   let lookup x = inst . mvInstantiation <$> MapS.lookup x st
       -- we collect only those used definitions that are in @names@
-      emb d = if include d then Set.singleton d else Set.empty
+      emb d = Endo \s -> if Set.member d include then Set.insert d s
+                                                 else s
   -- get all the Defs that are in names
-  return $ getDefs' lookup emb a
+  return $! getDefs lookup emb a `appEndo` mempty
   where
   -- TODO: Is it bad to ignore the lambdas?
   inst (InstV i)                      = instBody i
-  inst Open                           = __IMPOSSIBLE__
-  inst OpenInstance                   = __IMPOSSIBLE__
+  inst OpenMeta{}                     = __IMPOSSIBLE__
   inst BlockedConst{}                 = __IMPOSSIBLE__
   inst PostponedTypeCheckingProblem{} = __IMPOSSIBLE__

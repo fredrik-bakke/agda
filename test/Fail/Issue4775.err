@@ -1,3 +1,3 @@
-Issue4775.agda:16,11-24
+Issue4775.agda:16.16-24: error: [ShouldBeRecordPattern]
 Expected record pattern
-when checking the let binding y1 , isSuc y2 = .patternInTele0
+when checking that the pattern isSuc y2 has type IsSuc y1

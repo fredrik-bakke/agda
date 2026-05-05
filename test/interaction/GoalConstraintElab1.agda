@@ -3,7 +3,6 @@
 open import Agda.Primitive renaming (Set to Type)
 open import Agda.Builtin.Cubical.Path
 open import Agda.Builtin.Cubical.Glue
-open import Agda.Builtin.Cubical.Id
 open import Agda.Builtin.Sigma
 open import Agda.Primitive.Cubical
   renaming
@@ -27,7 +26,7 @@ is-prop→is-set : (A : Type) → is-prop A → is-set A
 is-prop→is-set A ap x y p q i j = primHComp
   (λ { k (i = i0) → ap x (p j) k
      ; k (i = i1) → ap x (q j) k
-     ; k (j = i0) → {!   !}
-     ; k (j = i1) → {!   !}
+     ; k (j = i0) → {!ap x x k!}
+     ; k (j = i1) → {!ap x y k!}
      })
-  {! x   !}
+  {!x!}

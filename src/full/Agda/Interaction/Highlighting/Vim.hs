@@ -11,17 +11,17 @@ import Data.Maybe
 
 import System.FilePath
 
-import Agda.Syntax.Scope.Base
+import Agda.Syntax.Abstract.Name (AbstractName(..), KindOfName (FldName))
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty
 import Agda.Syntax.Concrete.Name as CName
+import Agda.Syntax.Scope.Base
 
 import Agda.TypeChecking.Monad
 
-import Agda.Utils.List1             ( List1, pattern (:|) )
-import qualified Agda.Utils.List1   as List1
-import qualified Agda.Utils.IO.UTF8 as UTF8
-import Agda.Utils.Tuple
-import Agda.Syntax.Common.Pretty
+import Agda.Utils.IO.UTF8 qualified as UTF8
+import Agda.Utils.List1 ( List1, pattern (:|) )
+import Agda.Utils.List1 qualified as List1
 
 vimFile :: FilePath -> FilePath
 vimFile file =
@@ -66,14 +66,14 @@ matches cons icons defs idefs flds iflds =
                      . List.sortBy (compare `on` f)
 
         foo :: String -> [List1 String] -> [(Int, String)]
-        foo cat = map (length . List1.head /\ match cat)
+        foo cat = map (length . List1.head &&& match cat)
 
 toVim :: NamesInScope -> String
 toVim ns = unlines $ matches mcons micons mdefs midefs mflds miflds
     where
-        cons = [ x | (x, con:|_) <- Map.toList ns, isJust $ isConName $ anameKind con ]
-        defs = [ x | (x, def:|_) <- Map.toList ns, isDefName (anameKind def) ]
-        flds = [ x | (x, fld:|_) <- Map.toList ns, anameKind fld == FldName  ]
+        cons = [ x | (x, con :| _) <- Map.toList ns, isJust $ isConName $ anameKind con ]
+        defs = [ x | (x, def :| _) <- Map.toList ns, isDefName (anameKind def) ]
+        flds = [ x | (x, fld :| _) <- Map.toList ns, anameKind fld == FldName  ]
 
         mcons = map prettyShow cons
         mdefs = map prettyShow defs

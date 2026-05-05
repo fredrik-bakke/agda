@@ -1,0 +1,8 @@
+Issue6663.agda:18.5-9: error: [UnequalTerms]
+The terms
+  0
+and
+  1
+are not equal at type Nat
+when checking that the expression refl has type
+Foo′ Nat 0 ≡ Foo′ Nat 1

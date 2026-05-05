@@ -2,12 +2,23 @@
 
 {-# LANGUAGE RebindableSyntax #-}
 
-module Agda.Utils.Function where
+module Agda.Utils.Function
+  ( module Agda.Utils.Function
+  , module Data.Function
+  ) where
 
 import Prelude hiding ( not, (&&), (||) )
+
+import Data.Function  ( on )
 import Data.String    ( fromString )       -- for RebindableSyntax, somehow not covered by Prelude
 
 import Agda.Utils.Boolean
+
+-- | Left-associative strict application.
+{-# INLINE ($$!) #-}
+infixl 9 $$!
+($$!) :: (a -> b) -> a -> b
+($$!) = \ !f !a -> f a
 
 -- | Repeat a state transition @f :: a -> (b, a)@ with output @b@
 --   while condition @cond@ on the output is true.
@@ -104,33 +115,56 @@ iterateUntilM r f = loop where
 -- The applications are calculated strictly.
 
 iterate' :: Integral i => i -> (a -> a) -> a -> a
-iterate' 0 _ x             = x
-iterate' n f x | n > 0     = iterate' (n - 1) f $! f x
-               | otherwise = error "iterate': Negative input."
+iterate' n f x
+  | n >= 0    = go n x
+  | otherwise = error "Agda.Utils.Function.iterate': Negative input."
+  where
+    go n x
+      | n > 0     = go (n - 1) $! f x
+      | otherwise = x
 
 -- * Iteration over Booleans.
 
 -- | @applyWhen b f a@ applies @f@ to @a@ when @b@.
-{-# SPECIALIZE applyWhen :: Bool -> (a -> a) -> (a -> a) #-}
 {-# INLINE applyWhen #-}
 applyWhen :: IsBool b => b -> (a -> a) -> a -> a
 applyWhen b f = if b then f else id
   -- Note: RebindableSyntax translates this if-then-else to ifThenElse of IsBool.
 
 -- | @applyUnless b f a@ applies @f@ to @a@ unless @b@.
-{-# SPECIALIZE applyUnless :: Bool -> (a -> a) -> (a -> a) #-}
 {-# INLINE applyUnless #-}
 applyUnless :: IsBool b => b -> (a -> a) -> a -> a
 applyUnless b f = if b then id else f
+  -- Note: RebindableSyntax translates this if-then-else to ifThenElse of IsBool.
+
+-- | @applyWhenIts p f a@ applies @f@ to @a@ when @p a@.
+{-# INLINE applyWhenIts #-}
+applyWhenIts :: IsBool b => (a -> b) -> (a -> a) -> a -> a
+applyWhenIts p f a = if p a then f a else a
+  -- Note: RebindableSyntax translates this if-then-else to ifThenElse of IsBool.
+
+-- | @applyUnlessIts p f a@ applies @f@ to @a@ unless @p a@.
+{-# INLINE applyUnlessIts #-}
+applyUnlessIts :: IsBool b => (a -> b) -> (a -> a) -> a -> a
+applyUnlessIts p f a = if p a then a else f a
+  -- Note: RebindableSyntax translates this if-then-else to ifThenElse of IsBool.
 
 -- | Monadic version of @applyWhen@
-{-# SPECIALIZE applyWhenM :: Monad m => m Bool -> (m a -> m a) -> m a -> m a #-}
 {-# INLINE applyWhenM #-}
 applyWhenM :: (IsBool b, Monad m) => m b -> (m a -> m a) -> m a -> m a
 applyWhenM mb f x = mb >>= \ b -> applyWhen b f x
 
 -- | Monadic version of @applyUnless@
-{-# SPECIALIZE applyUnlessM :: Monad m => m Bool -> (m a -> m a) -> m a -> m a #-}
 {-# INLINE applyUnlessM #-}
 applyUnlessM :: (IsBool b, Monad m) => m b -> (m a -> m a) -> m a -> m a
 applyUnlessM mb f x = mb >>= \ b -> applyUnless b f x
+
+-- | 'Maybe' version of 'applyWhen'.
+{-# INLINE applyWhenJust #-}
+applyWhenJust :: Maybe b -> (b -> a -> a) -> a -> a
+applyWhenJust m f = maybe id f m
+
+-- | 'Maybe' version of 'applyUnless'.
+{-# INLINE applyWhenNothing #-}
+applyWhenNothing :: Maybe b -> (a -> a) -> a -> a
+applyWhenNothing m f = maybe f (const id) m

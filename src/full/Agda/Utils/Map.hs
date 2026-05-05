@@ -2,80 +2,84 @@
 
 module Agda.Utils.Map where
 
+import Control.Monad ((<$!>))
+
 import Data.Functor.Compose
-import Data.Map (Map)
-import qualified Data.Map as Map
--- import Data.Maybe (mapMaybe) -- UNUSED
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
+import Data.Map.Internal (Map(..), balanceL, balanceR, singleton)
+import Data.Maybe (mapMaybe)
+import Data.Set (Set)
+import Data.Set qualified as Set
 
 import Agda.Utils.Impossible
 
 -- * Monadic map operations
 ---------------------------------------------------------------------------
 
+{-# INLINE insertWithGood #-}
+-- | Version of `insertWith` that's willing to be properly inlined. The extra @c@ argument
+--   is passed down to the insertions unchanged. It can be used to avoid closure creation
+--   for the loop.
+insertWithGood :: forall k a c. Ord k => (c -> a -> a -> a) -> c -> k -> a -> Map k a -> Map k a
+insertWithGood f c k !a = go c k a where
+  go :: c -> k -> a -> Map k a -> Map k a
+  go !c !kx x Tip               = singleton kx x
+  go  c  kx x (Bin sy ky y l r) = case compare kx ky of
+    LT -> balanceL ky y (go c kx x l) r
+    GT -> balanceR ky y l (go c kx x r)
+    EQ -> let !y' = f c x y in Bin sy kx y' l r
+
+{-# INLINE forGood_ #-}
+-- | Version of `forM_` that deigns to be properly lambda-lifted for State, Reader, etc.
+forGood_ :: forall k v m. Applicative m => Map k v -> (v -> m ()) -> m ()
+forGood_ m f = go m where
+  go Tip             = pure ()
+  go (Bin _ k v l r) = go l *> f v *> go r
+
+{-# INLINE forWithKey_ #-}
+forWithKey_ :: forall k v m. Applicative m => Map k v -> (k -> v -> m ()) -> m ()
+forWithKey_ m f = go m where
+  go Tip             = pure ()
+  go (Bin _ k v l r) = go l *> f k v *> go r
+
+{-# INLINE adjustM #-}
 -- | Update monadically the value at one position (must exist!).
 adjustM :: (Functor f, Ord k) => (v -> f v) -> k -> Map k v -> f (Map k v)
-#if MIN_VERSION_containers(0,5,8)
 adjustM f = Map.alterF $ \case
   Nothing -> __IMPOSSIBLE__
   Just v  -> Just <$> f v
-#else
-adjustM f k m =
-  f (Map.findWithDefault __IMPOSSIBLE__ k m) <&> \ v -> Map.insert k v m
-#endif
 
+{-# INLINE adjustM' #-}
 -- | Wrapper for 'adjustM' for convenience.
 adjustM' :: (Functor f, Ord k) => (v -> f (a, v)) -> k -> Map k v -> f (a, Map k v)
 adjustM' f k = getCompose . adjustM (Compose . f) k
 
--- UNUSED Liang-Ting Chen (05-07-2019)
--- data EitherOrBoth a b = L a | B a b | R b
---
--- -- | Not very efficient (goes via a list), but it'll do.
--- unionWithM :: (Ord k, Monad m) => (a -> a -> m a) -> Map k a -> Map k a -> m (Map k a)
--- unionWithM f m1 m2 = fromList <$> mapM combine (toList m)
---     where
---         m = unionWith both (map L m1) (map R m2)
---
---         both (L a) (R b) = B a b
---         both _     _     = __IMPOSSIBLE__
---
---         combine (k, B a b) = (,) k <$> f a b
---         combine (k, L a)   = return (k, a)
---         combine (k, R b)   = return (k, b)
---
--- UNUSED Liang-Ting Chen (05-07-2019)
--- insertWithKeyM :: (Ord k, Monad m) => (k -> a -> a -> m a) -> k -> a -> Map k a -> m (Map k a)
--- insertWithKeyM clash k x m =
---     case lookup k m of
---         Just y  -> do
---             z <- clash k x y
---             return $ insert k z m
---         Nothing -> return $ insert k x m
-
 -- * Non-monadic map operations
 ---------------------------------------------------------------------------
 
--- UNUSED Liang-Ting Chen (05-07-2019)
--- -- | Big conjunction over a map.
--- allWithKey :: (k -> a -> Bool) -> Map k a -> Bool
--- allWithKey f = Map.foldrWithKey (\ k a b -> f k a && b) True
-
+#if !MIN_VERSION_containers(0,8,0)
+{-# INLINE filterKeys #-}
 -- | Filter a map based on the keys.
 filterKeys :: (k -> Bool) -> Map k a -> Map k a
 filterKeys p = Map.filterWithKey (const . p)
+#endif
 
--- UNUSED Andreas (2021-08-19)
--- -- | O(n log n).  Rebuilds the map from scratch.
--- --   Not worse than 'Map.mapKeys'.
--- mapMaybeKeys :: (Ord k1, Ord k2) => (k1 -> Maybe k2) -> Map k1 a -> Map k2 a
--- mapMaybeKeys f = Map.fromList . mapMaybe (\ (k,a) -> (,a) <$> f k) . Map.toList
+-- | Filter a map and rewrite the keys.
+mapKeysMaybe :: Ord k => (k -> Maybe k) -> Map k a -> Map k a
+mapKeysMaybe f = Map.fromList . mapMaybe (\ (k, a) -> (, a) <$> f k) . Map.toList
 
--- UNUSED Liang-Ting Chen (05-07-2019)
--- -- | Unzip a map.
--- unzip :: Map k (a, b) -> (Map k a, Map k b)
--- unzip m = (Map.map fst m, Map.map snd m)
---
--- UNUSED Liang-Ting Chen (05-07-2019)
--- unzip3 :: Map k (a, b, c) -> (Map k a, Map k b, Map k c)
--- unzip3 m = (Map.map fst3 m, Map.map snd3 m, Map.map thd3 m)
---
+-- | Check whether a map is a singleton.
+isSingleMap :: Map k v -> Maybe (k, v)
+isSingleMap (Bin 1 k v _ _) = Just (k, v)
+isSingleMap _               = Nothing
+
+-- | @partitionKeys m s = 'Map.partition' (`Set.member` s) m@
+-- but with potential for efficient implementation.
+partitionKeys :: Ord k => Map k a -> Set k -> (Map k a, Map k a)
+partitionKeys m s = (Map.restrictKeys m s, Map.withoutKeys m s)
+
+-- | @partitionMap m m' = 'Map.partition' (`Map.member` m') m@
+-- but with potential for efficient implementation.
+partitionMap :: Ord k => Map k a -> Map k b -> (Map k a, Map k a)
+partitionMap m = partitionKeys m . Map.keysSet

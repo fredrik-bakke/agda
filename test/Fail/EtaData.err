@@ -1,3 +1,11 @@
-EtaData.agda:8,1-17
-ETA pragma is only applicable to coinductive records
-when checking the pragma ETA Prod
+EtaData.agda:5.1-21: warning: -W[no]InvalidEtaEqualityPragma
+The ETA_EQUALITY pragma can only precede a record definition.
+
+EtaData.agda:24.10-14: error: [UnequalTerms]
+The terms
+  x
+and
+  pair (fst x) (snd x)
+are not equal at type Prod A B
+when checking that the expression refl has type
+x ≡ pair (fst x) (snd x)

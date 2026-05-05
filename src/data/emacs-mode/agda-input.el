@@ -213,9 +213,9 @@ order for the change to take effect."
 
   ;; Inequality and similar symbols.
 
-  ("leq"  . ,(agda-input-to-string-list "<≪⋘≤≦≲ ≶≺≼≾⊂⊆ ⋐⊏⊑ ⊰⊲⊴⋖⋚⋜⋞＜"))
+  ("leq"  . ,(agda-input-to-string-list "<≪⋘≤≦≲ ≶≺≼≾⊂⊆⫇⫉ ⋐⊏⊑ ⊰⊲⊴⋖⋚⋜⋞＜"))
   ("leqn" . ,(agda-input-to-string-list "≮  ≰≨≴⋦≸⊀ ⋨⊄⊈⊊  ⋢⋤ ⋪⋬   ⋠"))
-  ("geq"  . ,(agda-input-to-string-list ">≫⋙≥≧≳ ≷≻≽≿⊃⊇ ⋑⊐⊒ ⊱⊳⊵⋗⋛⋝⋟＞"))
+  ("geq"  . ,(agda-input-to-string-list ">≫⋙≥≧≳ ≷≻≽≿⊃⊇⫈⫊ ⋑⊐⊒ ⊱⊳⊵⋗⋛⋝⋟＞"))
   ("geqn" . ,(agda-input-to-string-list "≯  ≱≩≵⋧≹⊁ ⋩⊅⊉⊋  ⋣⋥ ⋫⋭   ⋡"))
 
   ("<="   . ("≤"))  (">="   . ("≥"))
@@ -230,6 +230,8 @@ order for the change to take effect."
   ("subn"  . ("⊄"))  ("supn"  . ("⊅"))
   ("sub="  . ("⊆"))  ("sup="  . ("⊇"))
   ("sub=n" . ("⊈"))  ("sup=n" . ("⊉"))
+  ("sub~"  . ("⫇"))  ("sup~"  . ("⫈"))
+  ("sub~~"  . ("⫉"))  ("sup~~"  . ("⫊"))
 
   ("squb"   . ("⊏"))  ("squp"   . ("⊐"))
   ("squb="  . ("⊑"))  ("squp="  . ("⊒"))
@@ -254,7 +256,7 @@ order for the change to take effect."
   ("glb" . ("⊓"))  ("lub" . ("⊔"))
   ("Glb" . ("⨅"))  ("Lub" . ("⨆"))
 
-  ;; Entailment etc.
+  ;; Entailment, tacks, etc.
 
   ("entails" . ,(agda-input-to-string-list "⊢⊣⊤⊥⊦⊧⊨⊩⊪⊫⊬⊭⊮⊯"))
 
@@ -264,6 +266,16 @@ order for the change to take effect."
   ("||-"  . ("⊩"))  ("||-n" . ("⊮"))
   ("||="  . ("⊫"))  ("||=n" . ("⊯"))
   ("|||-" . ("⊪"))
+
+
+  ("tack" . ,(agda-input-to-string-list "⟘⟙⟛⟝⟞⫫⫪"))
+  ("Bot"  . ("⟘")) ;; similar to Glb/Lub vs. glb/lub
+  ("Top"  . ("⟙"))
+  ("-||-" . ("⟛"))
+  ("|--"  . ("⟝"))
+  ("--|"  . ("⟞"))
+  ("bbot" . ("⫫")) ;; similar to bN for blackboard N
+  ("btop" . ("⫪"))
 
   ;; Divisibility, parallelity.
 
@@ -304,6 +316,7 @@ order for the change to take effect."
   (":"         . ,(agda-input-to-string-list "∶⦂ː꞉˸፥፦：﹕︓"))
   (","         . ,(agda-input-to-string-list "ʻ،⸲⸴⹁⹉、︐︑﹐﹑，､"))
   (";"         . ,(agda-input-to-string-list "⨾⨟⁏፤꛶；︔﹔⍮⸵;"))
+  ("++"        . ("⧺"))
   ("::"        . ("∷"))
   ("::-"       . ("∺"))
   ("-:"        . ("∹"))
@@ -330,7 +343,7 @@ order for the change to take effect."
   ("oo"  . ("⊚"))
   ("o*"  . ("⊛"))
   ("o="  . ("⊜"))
-  ("o-"  . ("⊝"))
+  ("o-"  . ,(agda-input-to-string-list "⊝⟜"))
 
   ("O+"  . ("⨁"))
   ("Ox"  . ("⨂"))
@@ -435,6 +448,7 @@ order for the change to take effect."
   ("r->" . ("↣"))
 
   ("r-o" . ("⊸"))  ("-o"  . ("⊸"))
+  ("l-o" . ("⟜"))
 
   ("dz" . ("↯"))
 
@@ -886,12 +900,13 @@ order for the change to take effect."
   ("@"          . ("＠"))
   ("__"         . ("＿"))
   ("\""         . ("＂"))
+  ("crossmark"  . ("✗"))
 
   ;; Some combining characters.
   ;;
   ;; The following combining characters also have (other)
   ;; translations:
-  ;; ̀ ́ ̂ ̃ ̄ ̆ ̇ ̈ ̋ ̌ ̣ ̧ ̱
+  ;;
 
   ("^--" . ,(agda-input-to-string-list"̅̿"))
   ("_--" . ,(agda-input-to-string-list"̲̳"))
@@ -1495,6 +1510,34 @@ Suitable for use in the :set field of `defcustom'."
 ;; Set up the input method.
 
 (agda-input-setup)
+
+;; Allow disabling resizing of the minibuffer
+
+(defun agda-input--fix-quail-newline (arglist)
+  "Argument-filtering advice for `quail-minibuffer-message'.
+This function takes the argument list ARGLIST before it is
+applied to `quail-minibuffer-message', and makes sure the first
+and only argument has no newline.  This only has an effect if the
+Agda input method is active."
+  (save-match-data
+    (pcase arglist
+      ((and `(,(and (pred stringp) prompt))
+            (guard (string-match
+                    (rx "[" (literal (cadr (assoc "Agda" quail-package-alist))) "]" (group "\n"))
+                    prompt)))
+       (list (replace-match " " nil nil prompt 1)))
+      (_ arglist))))
+
+(defcustom agda-input-single-line nil
+  "Avoid the Agda input method from resizing the minibuffer."
+  :set (lambda (var val)
+         (if val
+             (advice-add #'quail-minibuffer-message :filter-args
+                         #'agda-input--fix-quail-newline)
+           (advice-remove #'quail-minibuffer-message
+                          #'agda-input--fix-quail-newline))
+         (custom-set-default var val))
+  :type 'boolean)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Administrative details

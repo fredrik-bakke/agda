@@ -1,3 +1,7 @@
-Issue1005.agda:8,19-20
-x₁ != x of type X
+Issue1005.agda:8.19-20: error: [UnequalTerms]
+The terms
+  x₁
+and
+  x
+are not equal at type X
 when checking that the expression t has type T x

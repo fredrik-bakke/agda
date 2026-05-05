@@ -1,6 +1,9 @@
 ..
   ::
+  {-# OPTIONS --erasure #-}
   module tools.compilers where
+
+  open import Agda.Builtin.Nat
 
 .. _compilers:
 
@@ -29,26 +32,68 @@ The GHC backend translates Agda programs into GHC Haskell programs.
 Usage
 ^^^^^
 
-The backend can be invoked from the command line using the flag
-``--compile``:
+The GHC backend can be invoked from the command line using the flag
+:option:`--compile` or :option:`--ghc`:
 
 .. code-block:: bash
 
-  agda --compile [--compile-dir=<DIR>] [--ghc-flag=<FLAG>]
-    [--ghc-strict-data] [--ghc-strict] <FILE>.agda
+  agda --compile
+    [--compile-dir=<DIR>]
+    [--ghc-flag=<FLAG>]
+    [--ghc-strict-data]
+    [--ghc-strict]
+    [--ghc-trace]
+    <FILE>.agda
 
-When the flag ``--ghc-strict-data`` is used inductive data and record
-constructors are compiled to constructors with strict arguments. (This
-does not apply to certain builtin types—lists, the maybe type, and
+When the flag :option:`--ghc-strict-data` is used, inductive data and record
+constructors are compiled to constructors with strict arguments.
+(This does not apply to certain builtin types—lists, the maybe type, and
 some types related to reflection—and might not apply to types with
 ``COMPILE GHC … = data …`` pragmas.)
 
-When the flag ``--ghc-strict`` is used the GHC backend generates
-mostly strict code. Note that functions might not be strict in unused
+When the flag :option:`--ghc-strict` is used, the GHC backend generates
+mostly strict code.  Note that functions might not be strict in unused
 arguments, and that function definitions coming from ``COMPILE GHC``
-pragmas are not affected. This flag implies ``--ghc-strict-data``, and
-the exceptions of that flag applies to this flag as well. (Note that
-this option requires the use of GHC 9 or later.)
+pragmas are not affected. This flag implies :option:`--ghc-strict-data`,
+and the exceptions of that flag applies to this flag as well.
+(Note that this option requires the use of GHC 9 or later.)
+
+Options
+~~~~~~~
+
+.. option:: --compile, --ghc
+
+     Compile to GHC Haskell placing the files in subdirectory ``MAlonzo`` or the directory given by :option:`--compile-dir`.
+     Then invoke ``ghc`` (or the compiler given by :option:`--with-compiler`) on the main file,
+     unless option :option:`--ghc-dont-call-ghc` is given.
+
+.. option:: --with-compiler={PATH}
+
+     Set ``PATH`` as the executable to call to compile the backend's
+     output, default: ``ghc``.
+
+.. option:: --ghc-dont-call-ghc
+
+     Only produce Haskell files, skip the compilation to binary.
+
+.. option:: --ghc-flag={GHC-FLAG}
+
+     Pass flag :samp:`{GHC-FLAG}` to the Haskell compiler.  This option can be given several times.
+
+.. option:: --ghc-strict-data
+
+     Compile Agda constructor to strict Haskell constructors.
+
+.. option:: --ghc-strict
+
+     Generate strict Haskell code.
+
+.. option:: --ghc-trace
+
+     Instrument the code to trace function calls,
+     inserting a ``Debug.Trace.trace`` statement at the beginning of each function.
+
+See :ref:`compilation-options` for options common to the compiler backends.
 
 Pragmas
 ^^^^^^^
@@ -86,7 +131,8 @@ you can run the HelloWorld program which prints ``Hello, World!``.
 
 .. warning:: Frequent error when compiling: ``Float`` requires the
   `ieee754 <http://hackage.haskell.org/package/ieee754>`_ haskell library.
-  Usually ``cabal install ieee754`` in the command line does the trick.
+  Usually ``cabal v1-install ieee754`` or ``cabal v2-install --lib ieee754``
+  in the command line does the trick.
 
 .. _javascript-backend:
 
@@ -98,23 +144,63 @@ The JavaScript backend translates Agda code to JavaScript code.
 Usage
 ^^^^^
 
-The backend can be invoked from the command line using the flag
-``--js``:
+The JavaScript backend can be invoked from the command line using the flag :option:`--js`:
 
 .. code-block:: bash
 
-  agda --js [--js-optimize] [--js-minify] [--compile-dir=<DIR>] <FILE>.agda
+  agda --js --js-es6 [--js-optimize] [--js-minify] [--compile-dir=<DIR>] <FILE>.agda
 
-The ``--js-optimize`` flag makes the generated JavaScript code
+The :option:`--js-es6` flag makes the generated JavaScript code use ES6-style module syntax.
+
+The :option:`--js-optimize` flag makes the generated JavaScript code
 typically faster and less readable.
 
-The ``--js-minify`` flag makes the generated JavaScript code
+The :option:`--js-minify` flag makes the generated JavaScript code
 smaller and less readable.
 
-Agda can currently generate either CommonJS (used by NodeJS) flavour modules or
-AMD (for in-browser usage) flavour modules which can be toggled by ``--js-cjs``
-(default) and ``--js-amd`` flags.
+Options
+~~~~~~~
 
+.. option:: --js
+
+     Compile to JavaScript, placing translation of module :samp:`{M}` into file :samp:`jAgda.{M}.js`
+     (or :samp:`jAgda.{M}.mjs`, if the option :option:`--js-es6` is passed).
+     The files will be placed into the root directory of the compiled Agda project,
+     or into the directory given by :option:`--compile-dir`.
+
+.. option:: --js-es6
+
+    .. versionadded:: 2.8.0
+
+    Produce ES6 style modules (supported natively by browsers and NodeJS since 2020).
+
+.. option:: --js-amd
+
+     ..deprecated:: 2.9.0
+
+     Produce AMD style modules (for in-browser usage with a wrapper like `require.js`).
+
+.. option:: --js-cjs
+
+     ..deprecated:: 2.9.0
+
+     Produce CommonJS style modules (supported natively by NodeJS).
+     This is the default.
+
+.. option:: --js-minify
+
+     Produce minified JavaScript (e.g. omitting whitespace where possible).
+
+.. option:: --js-optimize
+
+     Produce optimized JavaScript.
+
+.. option:: --js-verify
+
+     Except for the main module, run the generated modules through ``node``,
+     to verify absence of syntax errors.
+
+See :ref:`compilation-options` for options common to the compiler backends.
 
 Optimizations
 -------------
@@ -134,6 +220,28 @@ and doesn't use builtin arithmetic likely becomes slower
 due to this optimization. If you find that this is the case,
 it is recommended to use a different, but
 isomorphic type to the builtin natural numbers.
+
+
+Irrelevant fields and constructor arguments
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Record fields and constructor arguments marked :ref:`irrelevant<irrelevance>`
+or :ref:`runtime irrelevant<runtime-irrelevance>` are completely erased from
+the compiled record or data type. For instance, ::
+
+  postulate Parity : Nat → Set
+
+  record PNat : Set where
+    field
+      n    : Nat
+      .p   : Parity n
+      @0 q : Parity (suc n)
+
+gets compiled by the GHC backend to (up to naming)
+
+.. code-block:: haskell
+
+  newtype PNat = PNat'constructor Integer
 
 
 Erasable types

@@ -1,4 +1,8 @@
-WrongDotPattern.agda:12,4-8
-zero != suc n of type Nat
+WrongDotPattern.agda:12.4-8: error: [UnequalTerms]
+The terms
+  zero
+and
+  suc n
+are not equal at type Nat
 when checking that the given dot pattern zero matches the inferred
 value suc n

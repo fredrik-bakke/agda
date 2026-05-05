@@ -1,23 +1,34 @@
+{-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
+{-# OPTIONS_GHC -Wunused-binds #-}
+
+{-# LANGUAGE CPP #-}
 
 -- | Attributes: concrete syntax for ArgInfo, esp. modalities.
 
 module Agda.Syntax.Concrete.Attribute where
 
-import Control.Arrow (second)
+import Prelude hiding (null)
+
 import Control.Monad (foldM)
 
+#if !MIN_VERSION_base(4,20,0)
 import Data.List (foldl')
+#endif
+
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe
 
 import Agda.Syntax.Common
-import Agda.Syntax.Concrete (Expr(..))
+import Agda.Syntax.Concrete (Expr(..), TacticAttribute)
+import qualified Agda.Syntax.Concrete as C
 import Agda.Syntax.Concrete.Pretty () --instance only
 import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Syntax.Position
 
-import Agda.Utils.List1 (List1, pattern (:|))
+import Agda.Utils.Null
+import Agda.Utils.Tuple (second)
 
 import Agda.Utils.Impossible
 
@@ -26,9 +37,11 @@ import Agda.Utils.Impossible
 data Attribute
   = RelevanceAttribute Relevance
   | QuantityAttribute  Quantity
-  | TacticAttribute Expr
+  | TacticAttribute (Ranged Expr)
   | CohesionAttribute Cohesion
+  | PolarityAttribute PolarityModality
   | LockAttribute      Lock
+  | RewriteAttribute RewriteAnn
   deriving (Show)
 
 instance HasRange Attribute where
@@ -36,36 +49,61 @@ instance HasRange Attribute where
     RelevanceAttribute r -> getRange r
     QuantityAttribute q  -> getRange q
     CohesionAttribute c  -> getRange c
+    PolarityAttribute p  -> getRange p
     TacticAttribute e    -> getRange e
-    LockAttribute l      -> NoRange
+    LockAttribute _l     -> NoRange
+    RewriteAttribute _r  -> NoRange
 
 instance SetRange Attribute where
   setRange r = \case
     RelevanceAttribute a -> RelevanceAttribute $ setRange r a
     QuantityAttribute q  -> QuantityAttribute  $ setRange r q
     CohesionAttribute c  -> CohesionAttribute  $ setRange r c
+    PolarityAttribute p  -> PolarityAttribute  $ setRange r p
     TacticAttribute e    -> TacticAttribute e  -- -- $ setRange r e -- SetRange Expr not yet implemented
     LockAttribute l      -> LockAttribute l
+    RewriteAttribute r   -> RewriteAttribute r
 
 instance KillRange Attribute where
   killRange = \case
     RelevanceAttribute a -> RelevanceAttribute $ killRange a
     QuantityAttribute q  -> QuantityAttribute  $ killRange q
     CohesionAttribute c  -> CohesionAttribute  $ killRange c
+    PolarityAttribute p  -> PolarityAttribute  $ killRange p
     TacticAttribute e    -> TacticAttribute    $ killRange e
     LockAttribute l      -> LockAttribute l
+    RewriteAttribute r   -> RewriteAttribute r
+
+-- | Parsed attribute.
+
+data Attr = Attr
+  { attrRange :: Range       -- ^ Range includes the @.
+  , attrName  :: String      -- ^ Concrete, user written attribute for error reporting, not including the "@".
+  , theAttr   :: Attribute   -- ^ Parsed attribute.
+  } deriving (Show)
+
+instance HasRange Attr where
+  getRange = attrRange
+
+instance SetRange Attr where
+  setRange r (Attr _ x a) = Attr r x a
+
+instance KillRange Attr where
+  killRange (Attr _ x a) = Attr noRange x (killRange a)
 
 -- | (Conjunctive constraint.)
 
-type LensAttribute a = (LensRelevance a, LensQuantity a, LensCohesion a, LensLock a)
+type LensAttribute a = (LensRelevance a, LensQuantity a, LensCohesion a, LensModalPolarity a, LensLock a, LensRewriteAnn a)
 
 -- | Modifiers for 'Relevance'.
 
 relevanceAttributeTable :: [(String, Relevance)]
-relevanceAttributeTable = concat
-  [ map (, Irrelevant)  [ "irr", "irrelevant" ]
-  , map (, NonStrict)   [ "shirr", "shape-irrelevant" ]
-  , map (, Relevant)    [ "relevant" ]
+relevanceAttributeTable =
+  [ ("irr"             , Irrelevant      $ OIrrIrr               noRange)
+  , ("irrelevant"      , Irrelevant      $ OIrrIrrelevant        noRange)
+  , ("shirr"           , ShapeIrrelevant $ OShIrrShIrr           noRange)
+  , ("shape-irrelevant", ShapeIrrelevant $ OShIrrShapeIrrelevant noRange)
+  , ("relevant"        , Relevant        $ ORelRelevant          noRange)
   ]
 
 -- | Modifiers for 'Quantity'.
@@ -91,6 +129,8 @@ cohesionAttributeTable :: [(String, Cohesion)]
 cohesionAttributeTable =
   [ ("♭"    , Flat)
   , ("flat" , Flat)
+  , ("♯"    , Sharp)
+  , ("sharp", Sharp)
   ]
 
 -- | Information about attributes (attribute, range, printed
@@ -102,9 +142,19 @@ cohesionAttributeTable =
 -- 'Agda.Syntax.Translation.ConcreteToAbstract.checkAttributes', which
 -- should not be called until after pragma options have been set.
 
-type Attributes = [(Attribute, Range, String)]
+type Attributes = [Attr]
 
--- | Modifiers for 'Quantity'.
+-- | Modifiers for 'Polarity'.
+
+polarityAttributeTable :: [(String, PolarityModality)]
+polarityAttributeTable =
+  [ ("unused" , withStandardLock UnusedPolarity)
+  , ("++" , withStandardLock StrictlyPositive)
+  , ("+" , withStandardLock Positive)
+  , ("-" , withStandardLock Negative)
+  , ("mixed" , withStandardLock MixedPolarity)]
+
+-- | Modifiers for 'Lock'.
 
 lockAttributeTable :: [(String, Lock)]
 lockAttributeTable = concat
@@ -113,6 +163,13 @@ lockAttributeTable = concat
   , map (, IsLock LockOLock) [ "lock" ] -- @lock
   ]
 
+-- | Modifiers for @RewriteAnn@
+--   I don't think we ever actually hit this because 'rewrite' is a keyword
+--   Of course, we might want to add aliases
+rewriteAttributeTable :: [(String, RewriteAnn)]
+rewriteAttributeTable =
+  [ ("rewrite" , IsRewrite noRange)
+  ]
 
 -- | Concrete syntax for all attributes.
 
@@ -121,7 +178,9 @@ attributesMap = Map.fromListWith __IMPOSSIBLE__ $ concat
   [ map (second RelevanceAttribute) relevanceAttributeTable
   , map (second QuantityAttribute)  quantityAttributeTable
   , map (second CohesionAttribute)  cohesionAttributeTable
+  , map (second PolarityAttribute)  polarityAttributeTable
   , map (second LockAttribute)      lockAttributeTable
+  , map (second RewriteAttribute)   rewriteAttributeTable
   ]
 
 -- | Parsing a string into an attribute.
@@ -131,9 +190,10 @@ stringToAttribute = (`Map.lookup` attributesMap)
 
 -- | Parsing an expression into an attribute.
 
-exprToAttribute :: Expr -> Maybe Attribute
-exprToAttribute (Paren _ (Tactic _ t)) = Just $ TacticAttribute t
-exprToAttribute e = setRange (getRange e) $ stringToAttribute $ prettyShow e
+exprToAttribute :: Range -> Expr -> Maybe Attribute
+exprToAttribute r = \case
+  Paren _ (Tactic _ t) -> Just $ TacticAttribute $ Ranged r t
+  e -> setRange r $ stringToAttribute $ prettyShow e
 
 -- | Setting an attribute (in e.g. an 'Arg').  Overwrites previous value.
 
@@ -142,8 +202,10 @@ setAttribute = \case
   RelevanceAttribute r -> setRelevance r
   QuantityAttribute  q -> setQuantity  q
   CohesionAttribute  c -> setCohesion  c
+  PolarityAttribute  p -> setModalPolarity p
   LockAttribute      l -> setLock      l
-  TacticAttribute t    -> id
+  RewriteAttribute   r -> setRewriteAnn r
+  TacticAttribute _    -> id
 
 
 -- | Setting some attributes in left-to-right order.
@@ -161,7 +223,7 @@ setAttributes attrs arg = foldl' (flip setAttribute) arg attrs
 
 setPristineRelevance :: (LensRelevance a) => Relevance -> a -> Maybe a
 setPristineRelevance r a
-  | getRelevance a == defaultRelevance = Just $ setRelevance r a
+  | null (getRelevance a) = Just $ setRelevance r a
   | otherwise = Nothing
 
 -- | Setting 'Quantity' if unset.
@@ -175,7 +237,14 @@ setPristineQuantity q a
 
 setPristineCohesion :: (LensCohesion a) => Cohesion -> a -> Maybe a
 setPristineCohesion c a
-  | getCohesion a == defaultCohesion = Just $ setCohesion c a
+  | null (getCohesion a) = Just $ setCohesion c a
+  | otherwise = Nothing
+
+-- | Setting 'ModalPolarity' if unset.
+
+setPristinePolarity :: (LensModalPolarity a) => PolarityModality -> a -> Maybe a
+setPristinePolarity c a
+  | getModalPolarity a == defaultPolarity = Just $ setModalPolarity c a
   | otherwise = Nothing
 
 -- | Setting 'Lock' if unset.
@@ -185,6 +254,13 @@ setPristineLock q a
   | getLock a == defaultLock = Just $ setLock q a
   | otherwise = Nothing
 
+-- | Setting 'RewriteAnn' if unset.
+
+setPristineRewriteAnn :: (LensRewriteAnn a) => RewriteAnn -> a -> Maybe a
+setPristineRewriteAnn q a
+  | getRewriteAnn a == defaultRewrite = Just $ setRewriteAnn q a
+  | otherwise = Nothing
+
 -- | Setting an unset attribute (to e.g. an 'Arg').
 
 setPristineAttribute :: (LensAttribute a) => Attribute -> a -> Maybe a
@@ -192,7 +268,9 @@ setPristineAttribute = \case
   RelevanceAttribute r -> setPristineRelevance r
   QuantityAttribute  q -> setPristineQuantity  q
   CohesionAttribute  c -> setPristineCohesion  c
+  PolarityAttribute  p -> setPristinePolarity  p
   LockAttribute      l -> setPristineLock      l
+  RewriteAttribute   r -> setPristineRewriteAnn r
   TacticAttribute{}    -> Just
 
 -- | Setting a list of unset attributes.
@@ -214,9 +292,15 @@ isQuantityAttribute = \case
   QuantityAttribute q -> Just q
   _ -> Nothing
 
-isTacticAttribute :: Attribute -> Maybe Expr
-isTacticAttribute (TacticAttribute t) = Just t
-isTacticAttribute _                   = Nothing
+isTacticAttribute :: Attribute -> TacticAttribute
+isTacticAttribute = C.TacticAttribute . \case
+  TacticAttribute t -> Just t
+  _ -> Nothing
+
+isRewriteAttribute :: Attribute -> Maybe RewriteAnn
+isRewriteAttribute = \case
+  RewriteAttribute q -> Just q
+  _                  -> Nothing
 
 relevanceAttributes :: [Attribute] -> [Attribute]
 relevanceAttributes = filter $ isJust . isRelevanceAttribute
@@ -225,4 +309,7 @@ quantityAttributes :: [Attribute] -> [Attribute]
 quantityAttributes = filter $ isJust . isQuantityAttribute
 
 tacticAttributes :: [Attribute] -> [Attribute]
-tacticAttributes = filter $ isJust . isTacticAttribute
+tacticAttributes = filter $ isJust . C.theTacticAttribute . isTacticAttribute
+
+rewAttributes :: [Attribute] -> [Attribute]
+rewAttributes = filter $ isJust . isRewriteAttribute

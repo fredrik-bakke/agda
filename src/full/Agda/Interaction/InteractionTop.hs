@@ -1,6 +1,6 @@
 {-# LANGUAGE NondecreasingIndentation #-}
 {-# OPTIONS_GHC -fno-cse #-}
-{-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 
 module Agda.Interaction.InteractionTop
   ( module Agda.Interaction.InteractionTop
@@ -13,53 +13,54 @@ import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Concurrent.STM.TChan
 import Control.Concurrent.STM.TVar
-
 import qualified Control.Exception  as E
 
-import Control.Monad
 import Control.Monad.Except         ( MonadError(..), ExceptT(..), runExceptT )
 import Control.Monad.IO.Class       ( MonadIO(..) )
-import Control.Monad.Fail           ( MonadFail )
 import Control.Monad.State          ( MonadState(..), gets, modify, runStateT )
 import Control.Monad.STM
-import Control.Monad.Trans          ( lift )
+import Control.Monad.State          ( StateT )
 
-import qualified Data.Char as Char
-import Data.Function (on)
-import qualified Data.List as List
-import qualified Data.Map as Map
+import Data.Char     qualified as Char
+import Data.Either   ( partitionEithers )
+import Data.Function ( on )
+import Data.List     qualified as List
+import Data.Map      qualified as Map
 import Data.Maybe
+import Data.Set      qualified as Set
 
 import System.Directory
 import System.FilePath
 
 import Agda.TypeChecking.Monad as TCM
-  hiding (initState, setCommandLineOptions)
-import qualified Agda.TypeChecking.Monad as TCM
 import qualified Agda.TypeChecking.Pretty as TCP
-import Agda.TypeChecking.Rules.Term (checkExpr, isType_)
 import Agda.TypeChecking.Errors
-import Agda.TypeChecking.Warnings (runPM, warning)
+import Agda.TypeChecking.Opacity (saturateOpaqueBlocks)
+import Agda.TypeChecking.Rules.Term (checkExpr, isType_)
+import Agda.TypeChecking.Warnings (warning)
 
 import Agda.Syntax.Fixity
 import Agda.Syntax.Position
 import Agda.Syntax.Parser
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty hiding (Mode)
 import Agda.Syntax.Concrete as C
 import Agda.Syntax.Concrete.Glyph
 import Agda.Syntax.Abstract as A
 import Agda.Syntax.Abstract.Pretty
 import Agda.Syntax.Info (mkDefInfo)
 import Agda.Syntax.Translation.ConcreteToAbstract
-import Agda.Syntax.Translation.AbstractToConcrete hiding (withScope)
+import Agda.Syntax.Translation.AbstractToConcrete
+import Agda.Syntax.Translation.InternalToAbstract (reify)
 import Agda.Syntax.Scope.Base
 import Agda.Syntax.TopLevelModuleName
 
 import Agda.Interaction.Base
-import Agda.Interaction.ExitCode
+import Agda.Interaction.ExitCode (pattern TCMError, exitAgdaWith)
 import Agda.Interaction.FindFile
 import Agda.Interaction.Options
 import Agda.Interaction.Options.Lenses as Lenses
+import Agda.Interaction.Options.ProfileOptions qualified as Profile
 import Agda.Interaction.MakeCase
 import Agda.Interaction.SearchAbout
 import Agda.Interaction.Response hiding (Function, ExtendedLambda)
@@ -68,22 +69,25 @@ import qualified Agda.Interaction.BasicOps as B
 import Agda.Interaction.Highlighting.Precise hiding (Error, Postulate, singleton)
 import Agda.Interaction.Imports  ( Mode, pattern ScopeCheck, pattern TypeCheck )
 import qualified Agda.Interaction.Imports as Imp
+import Agda.Interaction.Command
+  (CommandM, liftLocalState, revLift, revLiftTC, localStateCommandM)
 import Agda.Interaction.Highlighting.Generate
 
 import Agda.Compiler.Backend
 
-import Agda.Auto.Auto as Auto
+import Agda.Mimer.Mimer as Mimer
 
 import Agda.Utils.Either
 import Agda.Utils.FileName
 import Agda.Utils.Function
 import Agda.Utils.Hash
+import Agda.Utils.IO (showIOException)
 import Agda.Utils.Lens
-import qualified Agda.Utils.Maybe.Strict as Strict
+import Agda.Utils.List (sortOnM)
+import Agda.Utils.Maybe.Strict qualified as Strict
+import Agda.Utils.Maybe (whenJust)
 import Agda.Utils.Monad
 import Agda.Utils.Null
-import Agda.Syntax.Common.Pretty hiding (Mode)
-import qualified Agda.Utils.ProfileOptions as Profile
 import Agda.Utils.Singleton
 import Agda.Utils.String
 import Agda.Utils.Time
@@ -91,49 +95,6 @@ import Agda.Utils.Tuple
 import Agda.Utils.WithDefault (lensCollapseDefault, lensKeepDefault)
 
 import Agda.Utils.Impossible
-
-------------------------------------------------------------------------
--- The CommandM monad
-
--- | Restore both 'TCState' and 'CommandState'.
-
-localStateCommandM :: CommandM a -> CommandM a
-localStateCommandM m = do
-  cSt <- get
-  tcSt <- getTC
-  x <- m
-  putTC tcSt
-  put cSt
-  return x
-
--- | Restore 'TCState', do not touch 'CommandState'.
-
-liftLocalState :: TCM a -> CommandM a
-liftLocalState = lift . localTCState
-
--- | Build an opposite action to 'lift' for state monads.
-
-revLift
-    :: MonadState st m
-    => (forall c . m c -> st -> k (c, st))      -- ^ run
-    -> (forall b . k b -> m b)                  -- ^ lift
-    -> (forall x . (m a -> k x) -> k x) -> m a  -- ^ reverse lift in double negative position
-revLift run lift' f = do
-    st <- get
-    (a, st') <- lift' $ f (`run` st)
-    put st'
-    return a
-
-revLiftTC
-    :: MonadTCState m
-    => (forall c . m c -> TCState -> k (c, TCState))  -- ^ run
-    -> (forall b . k b -> m b)                        -- ^ lift
-    -> (forall x . (m a -> k x) -> k x) -> m a        -- ^ reverse lift in double negative position
-revLiftTC run lift' f = do
-    st <- getTC
-    (a, st') <- lift' $ f (`run` st)
-    putTC st'
-    return a
 
 -- | Opposite of 'liftIO' for 'CommandM'.
 --
@@ -187,7 +148,7 @@ getOldInteractionScope :: InteractionId -> CommandM ScopeInfo
 getOldInteractionScope ii = do
   ms <- gets $ Map.lookup ii . oldInteractionScopes
   case ms of
-    Nothing    -> fail $ "not an old interaction point: " ++ show ii
+    Nothing    -> __IMPOSSIBLE_VERBOSE__ $ "not an old interaction point: " ++ show ii
     Just scope -> return scope
 
 -- | Do setup and error handling for a command.
@@ -234,16 +195,18 @@ handleCommand wrap onFail cmd = handleNastyErrors $ wrap $ do
     -- AsyncCancelled, which is used to abort Agda.
     handleNastyErrors :: CommandM () -> CommandM ()
     handleNastyErrors m = commandMToIO $ \ toIO -> do
-      let handle e =
-            Right <$>
-              toIO (handleErr (Just Direct) $
-                        Exception noRange $ text $ E.displayException e)
 
-          asyncHandler e@AsyncCancelled = return (Left e)
+      let asyncHandler e@AsyncCancelled = return (Left e)
 
-          generalHandler (e :: E.SomeException) = handle e
+          ioHandler (e :: E.IOException) = Right <$> do
+            toIO $ handleErr (Just Direct) $ IOException Nothing noRange e
 
-      r <- ((Right <$> toIO m) `E.catch` asyncHandler)
+          generalHandler (e :: E.SomeException) = Right <$> do
+            toIO $ handleErr (Just Direct) $ GenericException $ showIOException e
+
+      r <- (Right <$> toIO m)
+             `E.catch` asyncHandler
+             `E.catch` ioHandler
              `E.catch` generalHandler
       case r of
         Right x -> return x
@@ -253,21 +216,23 @@ handleCommand wrap onFail cmd = handleNastyErrors $ wrap $ do
     -- error. Because this function may switch the focus to another file
     -- the status information is also updated.
     handleErr method e = do
+
+      -- TODO: make a better predicate for this
+      noError <- lift $ null <$> renderError e
+      unless noError do
+
         unsolved <- lift $ computeUnsolvedInfo
         err     <- lift $ errorHighlighting e
-        modFile <- lift $ useTC stModuleToSource
+        modFile <- lift $ useSession lensModuleToSource
         method  <- case method of
           Nothing -> lift $ viewTC eHighlightingMethod
           Just m  -> return m
         let info = convert $ err <> unsolved
                      -- Errors take precedence over unsolved things.
 
-        -- TODO: make a better predicate for this
-        noError <- lift $ null <$> renderError e
-
         showImpl <- lift $ optShowImplicit <$> useTC stPragmaOptions
         showIrr <- lift $ optShowIrrelevant <$> useTC stPragmaOptions
-        unless noError $ do
+        do
           mapM_ putResponse $
             [ Resp_DisplayInfo $ Info_Error $ Info_GenericError e ] ++
             tellEmacsToJumpToError (getRange e) ++
@@ -313,10 +278,8 @@ runInteraction iotcm =
     IOTCM current highlighting highlightingMethod cmd = iotcm Nothing
 
     inEmacs :: forall a. CommandM a -> CommandM a
-    inEmacs = liftCommandMT $ withEnv $ initEnv
-            { envHighlightingLevel  = highlighting
-            , envHighlightingMethod = highlightingMethod
-            }
+    inEmacs = liftCommandMT $ withEnv $ initEnv & eHighlightingLevel  .~ highlighting
+                                                & eHighlightingMethod .~ highlightingMethod
 
     -- If an independent command fails we should reset theCurrentFile (Issue853).
     onFail | independent cmd = modify $ \ s -> s { theCurrentFile = Nothing }
@@ -364,15 +327,8 @@ maybeAbort m = do
             _ -> return (Command (Just x))
         Right a -> do
           liftIO $ popAbortedCommands q a
-          putTC $ initState
-            { stPersistentState = stPersistentState tcState
-            , stPreScopeState   =
-                (stPreScopeState initState)
-                  { stPrePragmaOptions =
-                      stPrePragmaOptions
-                        (stPreScopeState tcState)
-                  }
-            }
+          putTC $ set lensPragmaOptions (tcState ^. lensPragmaOptions) $
+            initStateFromPersistentState $ stPersistentState tcState
           put $ (initCommandState (commandQueue commandState))
             { optionsOnReload = optionsOnReload commandState
             }
@@ -446,7 +402,7 @@ initialiseCommandQueue next = do
 
   _ <- forkIO (readCommands 0)
 
-  return (CommandQueue { .. })
+  return (CommandQueue { commands, abort })
 
 ---------------------------------------------------------
 
@@ -455,6 +411,7 @@ initialiseCommandQueue next = do
 
 independent :: Interaction -> Bool
 independent (Cmd_load {})                   = True
+independent Cmd_load_no_metas{}             = True
 independent (Cmd_compile {})                = True
 independent (Cmd_load_highlighting_info {}) = True
 independent Cmd_tokenHighlighting {}        = True
@@ -467,9 +424,11 @@ independent _                               = False
 updateInteractionPointsAfter :: Interaction -> Bool
 updateInteractionPointsAfter Cmd_load{}                          = True
 updateInteractionPointsAfter Cmd_compile{}                       = True
+updateInteractionPointsAfter Cmd_backend_top{}                   = True
+updateInteractionPointsAfter Cmd_backend_hole{}                  = True
 updateInteractionPointsAfter Cmd_constraints{}                   = False
 updateInteractionPointsAfter Cmd_metas{}                         = False
-updateInteractionPointsAfter Cmd_no_metas{}                      = False
+updateInteractionPointsAfter Cmd_load_no_metas{}                 = False
 updateInteractionPointsAfter Cmd_show_module_contents_toplevel{} = False
 updateInteractionPointsAfter Cmd_search_about_toplevel{}         = False
 updateInteractionPointsAfter Cmd_solveAll{}                      = True
@@ -506,48 +465,75 @@ updateInteractionPointsAfter Cmd_show_version{}                  = False
 updateInteractionPointsAfter Cmd_abort{}                         = False
 updateInteractionPointsAfter Cmd_exit{}                          = False
 
--- | Interpret an interaction
+getBackendName :: CompilerBackend -> BackendName
+getBackendName = \case
+  LaTeX -> "LaTeX"
+  QuickLaTeX -> "LaTeX"
+  OtherBackend "GHCNoMain" -> "GHC"
+  OtherBackend b -> b
+
+-- | Interpret an interaction.
+--
+-- For each goal command specific to an 'InteractionPoint'
+-- that comes with a 'Range' for this interaction point
+-- we first synchronize this 'Range' with the 'Range'
+-- Agda has stored for the interaction meta.
+-- In general, we consider the 'Range' sent with the command
+-- as more up-to-date than the  the 'Range' Agda has stored.
+-- This is because the editor keeps track of changes
+-- (that usually modify the position of interaction points),
+-- but Agda does not.
+--
+-- Some goal commands carry a 'Range' for reasons of uniformity but do not use it.
+-- For those, we do not synchronize the range.
 
 interpret :: Interaction -> CommandM ()
 
-interpret (Cmd_load m argv) =
+interpret (Cmd_load m argv) = do
   cmd_load' m argv True mode $ \_ -> interpret $ Cmd_metas AsIs
   where
   mode = TypeCheck
 
-interpret (Cmd_compile backend file argv) =
+interpret (Cmd_compile backend file argv) = do
   cmd_load' file argv allowUnsolved mode $ \ checkResult -> do
-    mw <- lift $ applyFlagsToTCWarnings $ crWarnings checkResult
-    case mw of
-      [] -> do
-        lift $ case backend of
-          LaTeX                    -> callBackend "LaTeX" IsMain checkResult
-          QuickLaTeX               -> callBackend "LaTeX" IsMain checkResult
-          OtherBackend "GHCNoMain" -> callBackend "GHC" NotMain checkResult   -- for backwards compatibility
-          OtherBackend b           -> callBackend b IsMain checkResult
+    ws <- lift $ applyFlagsToTCWarnings $ crWarnings checkResult
+    case null ws of
+      True -> do
+        lift $ callBackend (getBackendName backend) isMain checkResult
         display_info . Info_CompilationOk backend =<< lift B.getWarningsAndNonFatalErrors
-      w@(_:_) -> display_info $ Info_Error $ Info_CompilationError w
+      False -> display_info $ Info_Error $ Info_CompilationError ws
   where
   allowUnsolved = backend `elem` [LaTeX, QuickLaTeX]
   mode | QuickLaTeX <- backend = ScopeCheck
        | otherwise             = TypeCheck
+  isMain | OtherBackend "GHCNoMain" <- backend = NotMain
+         | otherwise                           = IsMain
 
-interpret Cmd_constraints =
-    display_info . Info_Constraints =<< lift B.getConstraints
+interpret (Cmd_backend_top backend cmd) = do
+  callBackendInteractTop (getBackendName backend) cmd
+
+interpret (Cmd_backend_hole ii rng s backend cmd) = do
+  rng <- syncInteractionRange ii rng
+  callBackendInteractHole (getBackendName backend) cmd ii rng s
+
+interpret (Cmd_constraints norm) = do
+  display_info . Info_Constraints =<< lift (B.getConstraints norm)
 
 interpret (Cmd_metas norm) = do
   ms <- lift $ B.getGoals' norm (max Simplified norm)
   display_info . Info_AllGoalsWarnings ms =<< lift B.getWarningsAndNonFatalErrors
 
-interpret Cmd_no_metas = do
-  metas <- getOpenMetas
-  unless (null metas) $
-    typeError $ GenericError "Unsolved meta-variables"
+interpret (Cmd_load_no_metas file) = do
+  -- Fail if there are open metas.
+  let allowMetas = False
+  cmd_load' file [] allowMetas TypeCheck $ \ result -> do
+    Imp.raiseNonFatalErrors result
+    unlessM (null <$> getOpenMetas) __IMPOSSIBLE__
 
-interpret (Cmd_show_module_contents_toplevel norm s) =
+interpret (Cmd_show_module_contents_toplevel norm s) = do
   atTopLevel $ showModuleContents norm noRange s
 
-interpret (Cmd_search_about_toplevel norm s) =
+interpret (Cmd_search_about_toplevel norm s) = do
   atTopLevel $ searchAbout norm noRange s
 
 interpret (Cmd_solveAll norm)        = solveInstantiatedGoals norm Nothing
@@ -565,22 +551,6 @@ interpret (Cmd_infer_toplevel norm s) = do
   (time, expr) <- parseAndDoAtToplevel (B.typeInCurrent norm) s
   state <- get
   display_info $ Info_InferredType state time expr
-
-interpret (Cmd_compute_toplevel cmode s) = do
-  (time, expr) <- parseAndDoAtToplevel action (B.computeWrapInput cmode s)
-  state <- get
-  display_info $ Info_NormalForm state cmode time expr
-    where
-    action = allowNonTerminatingReductions
-           . (if B.computeIgnoreAbstract cmode then ignoreAbstractMode else inConcreteMode)
-           . B.evalInCurrent cmode
--- interpret (Cmd_compute_toplevel cmode s) =
---   parseAndDoAtToplevel action Info_NormalForm $ computeWrapInput cmode s
---   where
---   action = allowNonTerminatingReductions
---          . (if computeIgnoreAbstract cmode then ignoreAbstractMode else inConcreteMode)
---          . (B.showComputed cmode <=< B.evalInCurrent)
-
 
 interpret (ShowImplicitArgs showImpl) = do
   opts <- lift commandLineOptions
@@ -603,14 +573,14 @@ interpret ToggleIrrelevantArgs = do
     over (lensPragmaOptions . lensOptShowIrrelevant . lensCollapseDefault) not opts
 
 interpret (Cmd_load_highlighting_info source) = do
-  l <- asksTC envHighlightingLevel
+  l <- viewTC eHighlightingLevel
   when (l /= None) $ do
     -- Make sure that the include directories have
     -- been set.
     setCommandLineOpts =<< lift commandLineOptions
     resp <- lift $ liftIO . tellToUpdateHighlighting =<< do
       ex        <- liftIO $ doesFileExist source
-      absSource <- liftIO $ SourceFile <$> absolute source
+      absSource <- srcFromPath =<< liftIO (absolute source)
       if ex
         then
            do
@@ -623,7 +593,7 @@ interpret (Cmd_load_highlighting_info source) = do
                 Just mi ->
                   if hashText (Imp.srcText src) == iSourceHash (miInterface mi)
                     then do
-                      modFile <- useTC stModuleToSource
+                      modFile <- useSession lensModuleToSource
                       method  <- viewTC eHighlightingMethod
                       return $ Just (iHighlighting $ miInterface mi, method, modFile)
                     else
@@ -634,7 +604,7 @@ interpret (Cmd_load_highlighting_info source) = do
     mapM_ putResponse resp
 
 interpret (Cmd_tokenHighlighting source remove) = do
-  info <- do l <- asksTC envHighlightingLevel
+  info <- do l <- viewTC eHighlightingLevel
              if l == None
                then return Nothing
                else do
@@ -651,7 +621,8 @@ interpret (Cmd_tokenHighlighting source remove) = do
     Nothing    -> return ()
 
 interpret (Cmd_highlight ii rng s) = do
-  l <- asksTC envHighlightingLevel
+  rng <- syncInteractionRange ii rng
+  l <- viewTC eHighlightingLevel
   when (l /= None) $ do
     scope <- getOldInteractionScope ii
     removeOldInteractionScope ii
@@ -675,10 +646,16 @@ interpret (Cmd_highlight ii rng s) = do
       (mapLeft (const err) <$> freshTCM m) `catchError` \ _ -> return (Left err)
       -- freshTCM to avoid scope checking creating new interaction points
 
-interpret (Cmd_give   force ii rng s) = give_gen force ii rng s Give
-interpret (Cmd_refine ii rng s) = give_gen WithoutForce ii rng s Refine
+interpret (Cmd_give   force ii rng s) = do
+  rng <- syncInteractionRange ii rng
+  give_gen force ii rng s Give
+
+interpret (Cmd_refine ii rng s) = do
+  rng <- syncInteractionRange ii rng
+  give_gen WithoutForce ii rng s Refine
 
 interpret (Cmd_intro pmLambda ii rng _) = do
+  rng <- syncInteractionRange ii rng
   ss <- lift $ B.introTactic pmLambda ii
   liftCommandMT (withInteractionId ii) $ case ss of
     []    -> do
@@ -691,78 +668,77 @@ interpret (Cmd_refine_or_intro pmLambda ii r s) = interpret $
   let s' = trim s
   in (if null s' then Cmd_intro pmLambda else Cmd_refine) ii r s'
 
-interpret (Cmd_autoOne ii rng hint) = do
-  -- Andreas, 2014-07-05 Issue 1226:
-  -- Save the state to have access to even those interaction ids
-  -- that Auto solves (since Auto gives the solution right away).
-  st <- getTC
-  (time , res) <- maybeTimed $ Auto.auto ii rng hint
-  case autoProgress res of
-   Solutions sols -> do
-    lift $ reportSLn "auto" 10 $ "Auto produced the following solutions " ++ show sols
-    forM_ sols $ \(ii', sol) -> do
-      -- Andreas, 2014-07-05 Issue 1226:
-      -- For highlighting, Resp_GiveAction needs to access
-      -- the @oldInteractionScope@s of the interaction points solved by Auto.
-      -- We dig them out from the state before Auto was invoked.
-      insertOldInteractionScope ii' =<< liftLocalState (putTC st >> getInteractionScope ii')
-      -- Andreas, 2014-07-07: NOT TRUE:
-      -- -- Andreas, 2014-07-05: The following should be obsolete,
-      -- -- as Auto has removed the interaction points already:
-      -- modifyTheInteractionPoints $ filter (/= ii)
-      putResponse $ Resp_GiveAction ii' $ Give_String sol
-    -- Andreas, 2014-07-07: Remove the interaction points in one go.
-    modifyTheInteractionPoints (List.\\ (map fst sols))
-    case autoMessage res of
-     Nothing  -> interpret $ Cmd_metas AsIs
-     Just msg -> display_info $ Info_Auto msg
-   FunClauses cs -> do
-    case autoMessage res of
-     Nothing  -> return ()
-     Just msg -> display_info $ Info_Auto msg
-    putResponse $ Resp_MakeCase ii R.Function cs
-   Refinement s -> give_gen WithoutForce ii rng s Refine
-  maybe (return ()) (display_info . Info_Time) time
+interpret (Cmd_autoOne norm ii rng str) = do
+  rng <- syncInteractionRange ii rng
+  iscope <- getInteractionScope ii
+  (time, result) <- maybeTimed $ Mimer.mimer norm ii rng str
+  case result of
+    MimerNoResult -> display_info $ Info_Auto "No solution found"
+    MimerExpr str -> do
+      res <- parseExprFromAuto ii rng str \ e -> do
+        insertOldInteractionScope ii iscope
+        _ <- liftTCM $ B.give WithForce ii e
+        putResponse $ Resp_GiveAction ii $ Give_String str
+        modifyTheInteractionPoints (List.delete ii)
+        whenJust time (display_info . Info_Time)
+      case res of
+        Left msg -> display_info $ Info_Auto msg
+        Right () -> return ()
+    MimerList sols -> do
+      display_info $ Info_Auto $ unlines $
+        [ "Solutions:" ] ++
+        [ "  " ++ show i ++ ". " ++ s | (i, s) <- sols ]
 
-interpret Cmd_autoAll = do
+interpret (Cmd_autoAll norm) = do
   iis <- getInteractionPoints
+  getOldScope <- do
+    st <- getTC
+    pure $ \ ii -> liftLocalState $ putTC st >> getInteractionScope ii
   unless (null iis) $ do
     let time = 1000 `div` length iis
     st <- getTC
-    solved <- forM iis $ \ ii -> do
+    (msgs, solveds) <- partitionEithers <$> forM iis \ ii -> do
       rng <- getInteractionRange ii
-      res <- Auto.auto ii rng ("-t " ++ show time ++ "ms")
-      case autoProgress res of
-        Solutions sols -> forM sols $ \ (jj, s) -> do
-            oldInteractionScope <- liftLocalState (putTC st >> getInteractionScope jj)
-            insertOldInteractionScope jj oldInteractionScope
-            putResponse $ Resp_GiveAction ii $ Give_String s
-            return jj
-        _ -> return []
-    modifyTheInteractionPoints (List.\\ concat solved)
+      res <- Mimer.mimer norm ii rng ("-t " ++ show time ++ "ms")
+      case res of
+        MimerNoResult -> pure $ Right []
+        MimerExpr str -> parseExprFromAuto ii rng str \ e -> do
+          iscope <- getOldScope ii
+          insertOldInteractionScope ii iscope
+          _ <- liftTCM $ B.give WithoutForce ii e
+          putResponse $ Resp_GiveAction ii $ Give_String str
+          pure [ii]
+        MimerList{} -> pure $ Right []    -- Don't list solutions in autoAll
+    unlessNull (concat solveds) \ solved -> modifyTheInteractionPoints (List.\\ solved)
+    unlessNull (concat msgs) (display_info . Info_Auto)
 
-interpret (Cmd_context norm ii _ _) =
+interpret (Cmd_context norm ii _ _) = do
   display_info . Info_Context ii =<< liftLocalState (B.getResponseContext norm ii)
 
 interpret (Cmd_helper_function norm ii rng s) = do
+  rng <- syncInteractionRange ii rng
   -- Create type of application of new helper function that would solve the goal.
-  helperType <- liftLocalState $ withInteractionId ii $ inTopContext $ B.metaHelperType norm ii rng s
+  helperType <- liftLocalState $ B.metaHelperType norm ii rng s
   display_info $ Info_GoalSpecific ii (Goal_HelperFunction helperType)
 
 interpret (Cmd_infer norm ii rng s) = do
+  rng <- syncInteractionRange ii rng
   expr <- liftLocalState $ withInteractionId ii $ B.typeInMeta ii norm =<< B.parseExprIn ii rng s
   display_info $ Info_GoalSpecific ii (Goal_InferredType expr)
 
-interpret (Cmd_goal_type norm ii _ _) =
+interpret (Cmd_goal_type norm ii _ _) = do
   display_info $ Info_GoalSpecific ii (Goal_CurrentGoal norm)
 
-interpret (Cmd_elaborate_give norm ii rng s) =
+interpret (Cmd_elaborate_give norm ii rng s) = do
+  rng <- syncInteractionRange ii rng
   give_gen WithoutForce ii rng s $ ElaborateGive norm
 
-interpret (Cmd_goal_type_context norm ii rng s) =
+interpret (Cmd_goal_type_context norm ii rng s) = do
+  rng <- syncInteractionRange ii rng
   cmd_goal_type_context_and GoalOnly norm ii rng s
 
 interpret (Cmd_goal_type_context_infer norm ii rng s) = do
+  rng <- syncInteractionRange ii rng
   -- In case of the empty expression to type, don't fail with
   -- a stupid parse error, but just fall back to
   -- Cmd_goal_type_context.
@@ -776,30 +752,33 @@ interpret (Cmd_goal_type_context_infer norm ii rng s) = do
   cmd_goal_type_context_and aux norm ii rng s
 
 interpret (Cmd_goal_type_context_check norm ii rng s) = do
-  term <- liftLocalState $ withInteractionId ii $ do
+  rng <- syncInteractionRange ii rng
+  expr <- liftLocalState $ withInteractionId ii $ do
     expr <- B.parseExprIn ii rng s
     goal <- B.typeOfMeta AsIs ii
     term <- case goal of
       OfType _ ty -> checkExpr expr =<< isType_ ty
       _           -> __IMPOSSIBLE__
-    B.normalForm norm term
-  cmd_goal_type_context_and (GoalAndElaboration term) norm ii rng s
+    reify =<< B.normalForm norm term
+  cmd_goal_type_context_and (GoalAndElaboration expr) norm ii rng s
 
-interpret (Cmd_show_module_contents norm ii rng s) =
+interpret (Cmd_show_module_contents norm ii rng s) = do
+  rng <- syncInteractionRange ii rng
   liftCommandMT (withInteractionId ii) $ showModuleContents norm rng s
 
-interpret (Cmd_why_in_scope_toplevel s) =
+interpret (Cmd_why_in_scope_toplevel s) = do
   atTopLevel $ whyInScope s
 
-interpret (Cmd_why_in_scope ii _range s) =
+interpret (Cmd_why_in_scope ii _range s) = do
   liftCommandMT (withInteractionId ii) $ whyInScope s
 
 interpret (Cmd_make_case ii rng s) = do
+  rng <- syncInteractionRange ii rng
   (f, casectxt, cs) <- lift $ makeCase ii rng s
   liftCommandMT (withInteractionId ii) $ do
     tel <- lift $ lookupSection (qnameModule f) -- don't shadow the names in this telescope
     unicode <- getsTC $ optUseUnicode . getPragmaOptions
-    pcs      :: [Doc]      <- lift $ inTopContext $ addContext tel $ mapM prettyA cs
+    pcs      :: [Doc]      <- lift $ inTopContext $ addContext tel $ mapM prettyAUnqualify cs
     let pcs' :: [String]    = List.map (extlam_dropName unicode casectxt . decorate) pcs
     lift $ reportSDoc "interaction.case" 60 $ TCP.vcat
       [ "InteractionTop.Cmd_make_case"
@@ -816,30 +795,17 @@ interpret (Cmd_make_case ii rng s) = do
         ]
       ]
     putResponse $ Resp_MakeCase ii (makeCaseVariant casectxt) pcs'
-  where
-    decorate = renderStyle (style { mode = OneLineMode })
 
-    makeCaseVariant :: CaseContext -> MakeCaseVariant
-    makeCaseVariant Nothing = R.Function
-    makeCaseVariant Just{}  = R.ExtendedLambda
-
-    -- very dirty hack, string manipulation by dropping the function name
-    -- and replacing the last " = " with " -> ". It's important not to replace
-    -- the equal sign in named implicit with an arrow!
-    extlam_dropName :: UnicodeOrAscii -> CaseContext -> String -> String
-    extlam_dropName _ Nothing x = x
-    extlam_dropName glyphMode Just{}  x
-        = unwords $ reverse $ replEquals $ reverse $ drop 1 $ words x
-      where
-        arrow = render $ _arrow $ specialCharactersForGlyphs glyphMode
-        replEquals ("=" : ws) = arrow : ws
-        replEquals (w   : ws) = w : replEquals ws
-        replEquals []         = []
+interpret (Cmd_compute_toplevel cmode s) = do
+  (time, expr) <- parseAndDoAtToplevel (B.computeInCurrent cmode) (B.computeWrapInput cmode s)
+  state <- get
+  display_info $ Info_NormalForm state cmode time expr
 
 interpret (Cmd_compute cmode ii rng s) = do
+  rng <- syncInteractionRange ii rng
   expr <- liftLocalState $ do
     e <- B.parseExprIn ii rng $ B.computeWrapInput cmode s
-    withInteractionId ii $ applyWhen (B.computeIgnoreAbstract cmode) ignoreAbstractMode $ B.evalInCurrent cmode e
+    withInteractionId ii $ B.computeInCurrent cmode e
   display_info $ Info_GoalSpecific ii (Goal_NormalForm cmode expr)
 
 interpret Cmd_show_version = display_info Info_Version
@@ -847,12 +813,63 @@ interpret Cmd_show_version = display_info Info_Version
 interpret Cmd_abort = return ()
 interpret Cmd_exit  = return ()
 
+-- | Try to parse an expression generated by Auto and feed it to the continuation if successful.
+--   If unsuccessful, just report the solution via 'Info_Auto'.
+parseExprFromAuto :: InteractionId -> Range -> String -> (A.Expr -> CommandM a) -> CommandM (Either String a)
+parseExprFromAuto ii rng str ret = do
+  liftTCM (runPMIO $ parseRangeString exprWhereParser rng str) >>= \case
+    -- Since the String comes from the Agda printer, we can ignore parse warnings.
+    -- Also, no @where@ clause will be attached to the expression.
+    (Right (C.ExprWhere ce _wh, _attrs), _warns) -> do
+      e <- withInteractionId ii $ liftTCM $ concreteToAbstract_ ce
+      Right <$> ret e
+    (Left err, _warns) -> return $ Left $ unlines
+        [ unwords [ prettyShow ii, ":=", str, " (fails to parse)" ]
+        , prettyShow $ killRange err
+            -- The range makes no sense since the string came from within Agda.
+        ]
+
+-- | If given range is empty, get the range of the interaction point.
+--   Otherwise, set the range of the interaction point to the given range.
+--
+--   The idea is that the interaction frontend may have a more recent range for an interaction point
+--   (for example, if the user has edited the file since the last command was sent).
+--
+--   There may be frontends that do not send ranges (like the interaction test suite),
+--   so in that case get the range from the interaction point.
+syncInteractionRange :: (MonadInteractionPoints m, MonadDebug m, MonadError TCErr m)
+  => InteractionId -> Range -> m Range
+syncInteractionRange ii r
+  | null r    = getInteractionRange ii
+  | otherwise = r <$ setInteractionRange r ii
+
+
+decorate :: Doc -> String
+decorate = renderStyle (style { mode = OneLineMode })
+
+makeCaseVariant :: CaseContext -> MakeCaseVariant
+makeCaseVariant Nothing = R.Function
+makeCaseVariant Just{}  = R.ExtendedLambda
+
+-- very dirty hack, string manipulation by dropping the function name
+-- and replacing the last " = " with " -> ". It's important not to replace
+-- the equal sign in named implicit with an arrow!
+extlam_dropName :: UnicodeOrAscii -> CaseContext -> String -> String
+extlam_dropName _ Nothing x = x
+extlam_dropName glyphMode Just{}  x
+    = unwords $ reverse $ replEquals $ reverse $ drop 1 $ words x
+  where
+    arrow = render $ _arrow $ specialCharactersForGlyphs glyphMode
+    replEquals ("=" : ws) = arrow : ws
+    replEquals (w   : ws) = w : replEquals ws
+    replEquals []         = []
+
 -- | Solved goals already instantiated internally
 -- The second argument potentially limits it to one specific goal.
 solveInstantiatedGoals :: Rewrite -> Maybe InteractionId -> CommandM ()
 solveInstantiatedGoals norm mii = do
   -- Andreas, 2016-10-23 issue #2280: throw away meta elims.
-  out <- lift $ localTC (\ e -> e { envPrintMetasBare = True }) $ do
+  out <- lift $ localTC (set ePrintMetasBare True) $ do
     sip <- B.getSolvedInteractionPoints False norm
            -- only solve metas which have a proper instantiation, i.e., not another meta
     let sip' = maybe id (\ ii -> filter ((ii ==) . fst3)) mii sip
@@ -881,17 +898,11 @@ cmd_load'
                -- ^ Continuation after successful loading.
   -> CommandM a
 cmd_load' file argv unsolvedOK mode cmd = do
-    fp <- liftIO $ absolute file
-    ex <- liftIO $ doesFileExist $ filePath fp
-    unless ex $ typeError $ GenericError $
-      "The file " ++ file ++ " was not found."
 
     -- Forget the previous "current file" and interaction points.
     modify $ \ st -> st { theInteractionPoints = []
                         , theCurrentFile       = Nothing
                         }
-
-    t <- liftIO $ getModificationTime file
 
     -- Update the status. Because the "current file" is not set the
     -- status is not "Checked".
@@ -912,7 +923,16 @@ cmd_load' file argv unsolvedOK mode cmd = do
     -- Parse the file.
     --
     -- Note that options are set below.
-    src <- lift $ Imp.parseSource (SourceFile fp)
+    fp  <- liftIO $ absolute file
+    sf  <- liftTCM $ srcFromPath fp
+    src <- lift $ Imp.parseSource sf
+    -- Andreas, 2024-08-03, see test/interaction/FileNotFound:
+    -- Run 'getModificationTime' after 'parseSource',
+    -- otherwise the user gets a weird error for non-existing files.
+    -- (We assume that parsing is fast in comparison to type-checking,
+    -- so it should not matter much whether we get the time stamp
+    -- before or after parsing.)
+    t   <- liftIO $ getModificationTime file
 
     -- Store the warnings.
     warnings <- useTC stTCWarnings
@@ -920,11 +940,11 @@ cmd_load' file argv unsolvedOK mode cmd = do
     -- All options are reset when a file is reloaded, including the
     -- choice of whether or not to display implicit arguments.
     opts0 <- gets optionsOnReload
-    backends <- useTC stBackends
+    backends <- useSession lensBackends
     let (z, warns) = runOptM $ parseBackendOptions backends argv opts0
     mapM_ (lift . warning . OptionWarning) warns
     case z of
-      Left err -> lift $ typeError $ GenericError err
+      Left err -> lift $ typeError $ OptionError err
       Right (_, opts) -> do
         opts <- lift $ addTrustedExecutables opts
         let update = over (lensOptAllowUnsolved . lensKeepDefault) (unsolvedOK &&)
@@ -932,7 +952,7 @@ cmd_load' file argv unsolvedOK mode cmd = do
         lift $ TCM.setCommandLineOptions' root $ mapPragmaOptions update opts
 
     -- Restore the warnings that were saved above.
-    modifyTCLens stTCWarnings (++ warnings)
+    modifyTCLens stTCWarnings $ Set.union warnings
 
     ok <- lift $ Imp.typeCheckMain mode src
 
@@ -957,7 +977,8 @@ cmd_load' file argv unsolvedOK mode cmd = do
 withCurrentFile :: CommandM a -> CommandM a
 withCurrentFile m = do
   mfile <- gets $ fmap currentFilePath . theCurrentFile
-  localTC (\ e -> e { envCurrentPath = mfile }) m
+  i <- traverse idFromFile mfile
+  localTC (set eCurrentPath i) m
 
 atTopLevel :: CommandM a -> CommandM a
 atTopLevel cmd = liftCommandMT B.atTopLevel cmd
@@ -985,7 +1006,7 @@ give_gen
   -> CommandM ()
 give_gen force ii rng s0 giveRefine = do
   let s = trim s0
-  reportSLn "interaction.give" 20 $ "give_gen  " ++ s
+  reportSDoc "interaction.give" 20 $ TCP.text ("give_gen  " ++ s) TCP.<+> TCP.pretty rng
   -- Andreas, 2015-02-26 if string is empty do nothing rather
   -- than giving a parse error.
   unless (null s) $ do
@@ -1006,7 +1027,7 @@ give_gen force ii rng s0 giveRefine = do
         mis  <- getInteractionPoints
         reportSLn "interaction.give" 30 $ "interaction points before = " ++ show mis
         given <- lift $ B.parseExprIn ii rng s
-        ae    <- lift $ give_ref force ii Nothing given
+        ae    <- lift $ give_ref force ii given
         mis' <- getInteractionPoints
         reportSLn "interaction.give" 30 $ "interaction points after = " ++ show mis'
         return (ae, given, mis' List.\\ mis)
@@ -1014,14 +1035,23 @@ give_gen force ii rng s0 giveRefine = do
     insertOldInteractionScope ii scope
     -- sort the new interaction points and put them into the state
     -- in replacement of the old interaction point
+    reportSDoc "interaction.give" 30 $ TCP.hsep $ ("new interaction points:" :) $
+      map (\ i -> TCP.prettyTCM =<< do (i,) <$> getInteractionRange i) iis
     iis' <- sortInteractionPoints iis
     modifyTheInteractionPoints $ replace ii iis'
     -- print abstract expr
-    ce        <- abstractToConcreteScope scope ae
+    ce <- abstractToConcreteScope scope ae
     reportS "interaction.give" 30
-      [ "ce = " ++ show ce
+      [ "ce = " ++ prettyShow ce
       , "scopePrecedence = " ++ show (scope ^. scopePrecedence)
       ]
+
+    -- Issue 7218: if the give/refine command creates an extended
+    -- lambda, it also needs to be added to the relevant unfolding sets.
+    -- The easiest way to make sure this is consistent is to just re-run
+    -- the saturation procedures.
+    saturateOpaqueBlocks
+
     -- if the command was @Give@, use the literal user input;
     -- Andreas, 2014-01-15, see issue 1020:
     -- Refine could solve a goal by introducing the sole constructor
@@ -1037,7 +1067,7 @@ give_gen force ii rng s0 giveRefine = do
     -- the highlighting is moved together with the text when the hole goes away.
     -- To make it work for refine we'd have to adjust the ranges.
     when literally $ do
-      l <- asksTC envHighlightingLevel
+      l <- viewTC eHighlightingLevel
       when (l /= None) $ lift $ do
         printHighlightingInfo KeepHighlighting =<<
           generateTokenInfoFromString rng s
@@ -1058,9 +1088,9 @@ give_gen force ii rng s0 giveRefine = do
 
 highlightExpr :: A.Expr -> TCM ()
 highlightExpr e =
-  localTC (\st -> st { envImportPath         = []
-                     , envHighlightingLevel  = NonInteractive
-                     , envHighlightingMethod = Direct }) $
+  localTC (  set eImportStack []
+           . set eHighlightingLevel NonInteractive
+           . set eHighlightingMethod Direct) $
     generateAndPrintSyntaxInfo decl Full True
   where
     dummy = mkName_ (NameId 0 noModuleNameHash) ("dummy" :: String)
@@ -1070,12 +1100,9 @@ highlightExpr e =
 -- | Sorts interaction points based on their ranges.
 
 sortInteractionPoints
-  :: (MonadInteractionPoints m, MonadError TCErr m, MonadFail m)
+  :: (MonadInteractionPoints m, MonadError TCErr m, MonadDebug m)
   => [InteractionId] -> m [InteractionId]
-sortInteractionPoints is =
-  map fst . List.sortBy (compare `on` snd) <$> do
-    forM is $ \ i -> do
-      (i,) <$> getInteractionRange i
+sortInteractionPoints = sortOnM getInteractionRange
 
 -- | Displays the current goal, the given document, and the current
 --   context.
@@ -1160,7 +1187,7 @@ displayStatus :: CommandM ()
 displayStatus =
   putResponse . Resp_Status  =<< status
 
--- | @display_info@ does what @'display_info'' False@ does, but
+-- | @display_info@ does what @'displayInfo' False@ does, but
 --   additionally displays some status information (see 'status' and
 --   'displayStatus').
 
@@ -1209,7 +1236,6 @@ tellToUpdateHighlighting (Just (info, method, modFile)) =
 tellEmacsToJumpToError :: Range -> [Response]
 tellEmacsToJumpToError r =
   case rStart r of
-    Nothing                                           -> []
-    Just (Pn { srcFile = Strict.Nothing })            -> []
-    Just (Pn { srcFile = Strict.Just f, posPos = p }) ->
-       [ Resp_JumpToError (filePath (rangeFilePath f)) p ]
+    Nothing                       -> []
+    Just (Pn' Strict.Nothing _ _)  -> []
+    Just (Pn' (Strict.Just f) p _) -> [Resp_JumpToError (filePath (rangeFilePath f)) p]

@@ -10,20 +10,21 @@ module Agda.Interaction.FindFile
   ( SourceFile(..), InterfaceFile(intFilePath)
   , toIFile, mkInterfaceFile
   , FindError(..), findErrorToTypeError
-  , findFile, findFile', findFile''
+  , findFile, findFile', findFile'_, findFile''
   , findInterfaceFile', findInterfaceFile
   , checkModuleName
-  , moduleName
   , rootNameModule
   , replaceModuleExtension
+  , dropAgdaExtension, hasAgdaExtension, stripAgdaExtension
   ) where
 
 import Prelude hiding (null)
 
 import Control.Monad
 import Control.Monad.Except
+import Control.Monad.State
 import Control.Monad.Trans
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import qualified Data.Map as Map
 import qualified Data.Text as T
 import System.FilePath
@@ -32,44 +33,45 @@ import Agda.Interaction.Library ( findProjectRoot )
 
 import Agda.Syntax.Concrete
 import Agda.Syntax.Parser
-import Agda.Syntax.Parser.Literate (literateExtsShortList)
 import Agda.Syntax.Position
 import Agda.Syntax.TopLevelModuleName
-
-import Agda.Interaction.Options ( optLocalInterfaces )
 
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.Benchmark (billTo)
 import qualified Agda.TypeChecking.Monad.Benchmark as Bench
 import {-# SOURCE #-} Agda.TypeChecking.Monad.Options
   (getIncludeDirs, libToTCM)
-import Agda.TypeChecking.Monad.State (topLevelModuleName)
-import Agda.TypeChecking.Warnings (runPM)
+import Agda.TypeChecking.Monad.State ( registerFileIdWithBuiltin, topLevelModuleName )
+import Agda.TypeChecking.Monad.Trace (runPM, setCurrentRange)
 
 import Agda.Version ( version )
 
 import Agda.Utils.Applicative ( (?$>) )
+import Agda.Utils.CallStack   ( HasCallStack )
+import Agda.Utils.FileId
 import Agda.Utils.FileName
 import Agda.Utils.List  ( stripSuffix, nubOn )
 import Agda.Utils.List1 ( List1, pattern (:|) )
+import Agda.Utils.List2 ( List2, pattern List2 )
 import qualified Agda.Utils.List1 as List1
+import qualified Agda.Utils.List2 as List2
 import Agda.Utils.Monad ( ifM, unlessM )
 import Agda.Syntax.Common.Pretty ( Pretty(..), prettyShow )
+import qualified Agda.Syntax.Common.Pretty as P
 import Agda.Utils.Singleton
+import Agda.Utils.Lens
 
 import Agda.Utils.Impossible
 
--- | Type aliases for source files and interface files.
---   We may only produce one of these if we know for sure that the file
---   does exist. We can always output an @AbsolutePath@ if we are not sure.
+-- This instance isn't producing something pretty.
+-- instance Pretty SourceFile where
+--   pretty = pretty . srcFileId
 
--- TODO: do not export @SourceFile@ and force users to check the
--- @AbsolutePath@ does exist.
-newtype SourceFile    = SourceFile    { srcFilePath :: AbsolutePath } deriving (Eq, Ord)
+-- | File must exist.
 newtype InterfaceFile = InterfaceFile { intFilePath :: AbsolutePath }
 
-instance Pretty SourceFile    where pretty = pretty . srcFilePath
-instance Pretty InterfaceFile where pretty = pretty . intFilePath
+instance Pretty InterfaceFile where
+  pretty = pretty . intFilePath
 
 -- | Makes an interface file from an AbsolutePath candidate.
 --   If the file does not exist, then fail by returning @Nothing@.
@@ -84,18 +86,19 @@ mkInterfaceFile fp = do
 -- | Converts an Agda file name to the corresponding interface file
 --   name. Note that we do not guarantee that the file exists.
 
-toIFile :: SourceFile -> TCM AbsolutePath
-toIFile (SourceFile src) = do
+toIFile :: HasCallStack => SourceFile -> TCM AbsolutePath
+toIFile (SourceFile fi) = do
+  src <- fileFromId fi -- partial function, thus HasCallStack
   let fp = filePath src
-  mroot <- ifM (optLocalInterfaces <$> commandLineOptions)
-               {- then -} (pure Nothing)
-               {- else -} (libToTCM $ findProjectRoot (takeDirectory fp))
-  pure $ replaceModuleExtension ".agdai" $ case mroot of
-    Nothing   -> src
-    Just root ->
+  let localIFile = replaceModuleExtension ".agdai" src
+  mroot <- libToTCM $ findProjectRoot (takeDirectory fp)
+  case mroot of
+    Nothing   -> pure localIFile
+    Just root -> do
       let buildDir = root </> "_build" </> version </> "agda"
-          fileName = makeRelative root fp
-      in mkAbsolute $ buildDir </> fileName
+      fileName <- liftIO $ makeRelativeCanonical root (filePath localIFile)
+      let separatedIFile = mkAbsolute $ buildDir </> fileName
+      pure separatedIFile
 
 replaceModuleExtension :: String -> AbsolutePath -> AbsolutePath
 replaceModuleExtension ext@('.':_) = mkAbsolute . (++ ext) .  dropAgdaExtension . filePath
@@ -106,22 +109,20 @@ replaceModuleExtension ext = replaceModuleExtension ('.':ext)
 -- Invariant: All paths are absolute.
 
 data FindError
-  = NotFound [SourceFile]
-    -- ^ The file was not found. It should have had one of the given
-    -- file names.
-  | Ambiguous [SourceFile]
-    -- ^ Several matching files were found.
-    --
-    -- Invariant: The list of matching files has at least two
-    -- elements.
+  = NotFound (List1 AbsolutePath)
+      -- ^ An Agda module was not found.
+      --   We were looking for it in one of the given include directories.
+  | Ambiguous (List2 AbsolutePath)
+      -- ^ Several matching files were found.
+  deriving Show
 
 -- | Given the module name which the error applies to this function
 -- converts a 'FindError' to a 'TypeError'.
 
 findErrorToTypeError :: TopLevelModuleName -> FindError -> TypeError
-findErrorToTypeError m (NotFound  files) = FileNotFound m (map srcFilePath files)
-findErrorToTypeError m (Ambiguous files) =
-  AmbiguousTopLevelModuleName m (map srcFilePath files)
+findErrorToTypeError m = \case
+  NotFound  dirs  -> FileNotFound m dirs
+  Ambiguous files -> AmbiguousTopLevelModuleName m files
 
 -- | Finds the source file corresponding to a given top-level module
 -- name. The returned paths are absolute.
@@ -141,49 +142,64 @@ findFile m = do
 --   SIDE EFFECT:  Updates 'stModuleToSource'.
 findFile' :: TopLevelModuleName -> TCM (Either FindError SourceFile)
 findFile' m = do
-    dirs         <- getIncludeDirs
-    modFile      <- useTC stModuleToSource
-    (r, modFile) <- liftIO $ findFile'' dirs m modFile
-    stModuleToSource `setTCLens` modFile
-    return r
+  dirs     <- getIncludeDirs
+  stateSessionLensM lensModuleToSource \modToSrc -> do
+    liftIO $ runStateT (findFile'' dirs m) modToSrc
+
+-- | A variant of 'findFile'' which manipulates an extra 'ModuleToSourceId'
+
+findFile'_ ::
+     List1 AbsolutePath
+       -- ^ Include paths.
+  -> TopLevelModuleName
+  -> StateT ModuleToSourceId TCM (Either FindError SourceFile)
+findFile'_ incs m = stateSessionLensM lensFileDict \dict -> do
+  m2s <- get
+  (r, ModuleToSource dict' m2s') <- liftIO $
+    runStateT (findFile'' incs m) $ ModuleToSource dict m2s
+  put m2s'
+  return (r, dict')
 
 -- | A variant of 'findFile'' which does not require 'TCM'.
 
-findFile''
-  :: [AbsolutePath]
-  -- ^ Include paths.
+findFile'' ::
+     List1 AbsolutePath
+       -- ^ Include paths.
   -> TopLevelModuleName
-  -> ModuleToSource
-  -- ^ Cached invocations of 'findFile'''. An updated copy is returned.
-  -> IO (Either FindError SourceFile, ModuleToSource)
-findFile'' dirs m modFile =
-  case Map.lookup m modFile of
-    Just f  -> return (Right (SourceFile f), modFile)
+  -> StateT ModuleToSource IO (Either FindError SourceFile)
+findFile'' dirs m = do
+  ModuleToSource dict modToSrc <- get
+  case Map.lookup m modToSrc of
+    Just sf -> return $ Right sf
     Nothing -> do
-      files          <- fileList acceptableFileExts
-      filesShortList <- fileList parseFileExtsShortList
-      existingFiles  <-
-        liftIO $ filterM (doesFileExistCaseSensitive . filePath . srcFilePath) files
-      return $ case nubOn id existingFiles of
-        []     -> (Left (NotFound filesShortList), modFile)
-        [file] -> (Right file, Map.insert m (srcFilePath file) modFile)
-        files  -> (Left (Ambiguous existingFiles), modFile)
+      files          <- liftIO $ fileList agdaFileExtensions
+      existingFiles  <- liftIO $ filterM (doesFileExistCaseSensitive . filePath) files
+      case nubOn id existingFiles of
+        [file]   -> do
+          let (i, dict') = registerFileIdWithBuiltin file dict
+          let src = SourceFile i
+          put $ ModuleToSource dict' $ Map.insert m src modToSrc
+          return (Right src)
+        []       -> do
+          return (Left (NotFound dirs))
+        f0:f1:fs -> return (Left (Ambiguous $ List2 f0 f1 fs))
   where
-    fileList exts = mapM (fmap SourceFile . absolute)
+    fileList exts = mapM absolute
                     [ filePath dir </> file
-                    | dir  <- dirs
+                    | dir  <- List1.toList dirs
                     , file <- map (moduleNameToFileName m) exts
                     ]
 
 -- | Finds the interface file corresponding to a given top-level
 -- module file. The returned paths are absolute.
 --
--- Raises 'Nothing' if the the interface file cannot be found.
+-- Raises 'Nothing' if the interface file cannot be found.
 
-findInterfaceFile'
-  :: SourceFile                 -- ^ Path to the source file
+findInterfaceFile' :: HasCallStack  -- We are calling partial function toIFile, thus want a call stack.
+  => SourceFile                 -- ^ Path to the source file
   -> TCM (Maybe InterfaceFile)  -- ^ Maybe path to the interface file
 findInterfaceFile' fp = liftIO . mkInterfaceFile =<< toIFile fp
+
 
 -- | Finds the interface file corresponding to a given top-level
 -- module file. The returned paths are absolute.
@@ -192,35 +208,37 @@ findInterfaceFile' fp = liftIO . mkInterfaceFile =<< toIFile fp
 -- 'Nothing' if the source file can be found but not the interface
 -- file.
 
-findInterfaceFile :: TopLevelModuleName -> TCM (Maybe InterfaceFile)
+findInterfaceFile :: HasCallStack  -- because of calling a partial function
+  => TopLevelModuleName -> TCM (Maybe InterfaceFile)
 findInterfaceFile m = findInterfaceFile' =<< findFile m
 
 -- | Ensures that the module name matches the file name. The file
 -- corresponding to the module name (according to the include path)
 -- has to be the same as the given file name.
 
-checkModuleName
-  :: TopLevelModuleName
-     -- ^ The name of the module.
+checkModuleName ::
+     TopLevelModuleName
+       -- ^ The name of the module.
   -> SourceFile
-     -- ^ The file from which it was loaded.
+       -- ^ The file from which it was loaded.
   -> Maybe TopLevelModuleName
-     -- ^ The expected name, coming from an import statement.
+       -- ^ The expected name, coming from an import statement.
   -> TCM ()
-checkModuleName name (SourceFile file) mexpected = do
+checkModuleName name src0 mexpected = do
+  file <- srcFilePath src0
   findFile' name >>= \case
 
-    Left (NotFound files)  -> typeError $
+    Left (NotFound dirs) -> typeError $
       case mexpected of
-        Nothing -> ModuleNameDoesntMatchFileName name (map srcFilePath files)
-        Just expected -> ModuleNameUnexpected name expected
+        Nothing -> ModuleNameDoesntMatchFileName name dirs
+        Just expected -> ModuleNameUnexpected (TopLevelModuleNameWithSourceFile name src0) expected
 
     Left (Ambiguous files) -> typeError $
-      AmbiguousTopLevelModuleName name (map srcFilePath files)
+      AmbiguousTopLevelModuleName name files
 
     Right src -> do
-      let file' = srcFilePath src
-      file <- liftIO $ absolute (filePath file)
+      file' <- srcFilePath src
+      file  <- liftIO $ absolute $ filePath file
       unlessM (liftIO $ sameFile file file') $
         typeError $ ModuleDefinedInOtherFile name file file'
 
@@ -228,59 +246,25 @@ checkModuleName name (SourceFile file) mexpected = do
   -- that we do not end up with a mismatch between expected
   -- and actual module name.
 
-  forM_ mexpected $ \ expected ->
+  forM_ mexpected \ expected ->
     unless (name == expected) $
       typeError $ OverlappingProjects file name expected
       -- OverlappingProjects is the correct error for
       -- test/Fail/customized/NestedProjectRoots
       -- -- typeError $ ModuleNameUnexpected name expected
 
+-- | Remove an Agda file extension from a filepath, if possible.
+stripAgdaExtension :: FilePath -> Maybe FilePath
+stripAgdaExtension = stripAnyOfExtensions agdaFileExtensions
 
--- | Computes the module name of the top-level module in the given
--- file.
---
--- If no top-level module name is given, then an attempt is made to
--- use the file name as a module name.
+-- | Check if a file path has an Agda extension.
+hasAgdaExtension :: FilePath -> Bool
+hasAgdaExtension = isJust . stripAgdaExtension
 
--- TODO: Perhaps it makes sense to move this procedure to some other
--- module.
+-- | Remove an existing Agda file extension from a file path.
+dropAgdaExtension :: FilePath -> FilePath
+dropAgdaExtension = fromMaybe __IMPOSSIBLE__ . stripAgdaExtension
 
-moduleName
-  :: AbsolutePath
-     -- ^ The path to the file.
-  -> Module
-     -- ^ The parsed module.
-  -> TCM TopLevelModuleName
-moduleName file parsedModule = billTo [Bench.ModuleName] $ do
-  let defaultName = rootNameModule file
-      raw         = rawTopLevelModuleNameForModule parsedModule
-  topLevelModuleName =<< if isNoName raw
-    then do
-      m <- runPM (fst <$> parse moduleNameParser defaultName)
-             `catchError` \_ ->
-           typeError $ GenericError $
-             "The file name " ++ prettyShow file ++
-             " is invalid because it does not correspond to a valid module name."
-      case m of
-        Qual {} ->
-          typeError $ GenericError $
-            "The file name " ++ prettyShow file ++ " is invalid because " ++
-            defaultName ++ " is not an unqualified module name."
-        QName {} ->
-          return $ RawTopLevelModuleName
-            { rawModuleNameRange = getRange m
-            , rawModuleNameParts = singleton (T.pack defaultName)
-            }
-    else return raw
-
-parseFileExtsShortList :: [String]
-parseFileExtsShortList = ".agda" : literateExtsShortList
-
-dropAgdaExtension :: String -> String
-dropAgdaExtension s = case catMaybes [ stripSuffix ext s
-                                     | ext <- acceptableFileExts ] of
-    [name] -> name
-    _      -> __IMPOSSIBLE__
 
 rootNameModule :: AbsolutePath -> String
 rootNameModule = dropAgdaExtension . snd . splitFileName . filePath

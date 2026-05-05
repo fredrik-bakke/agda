@@ -1,5 +1,9 @@
-Issue1362.agda:25,7-41
-quote D != quote M₁.D of type QName
+Issue1362.agda:25.7-41: error: [UnequalTerms]
+The terms
+  quote D
+and
+  quote M₁.D
+are not equal at type QName
 when checking that the inferred type of an application
   getType (quote D) ≡ getType (quote D)
 matches the expected type

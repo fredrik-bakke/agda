@@ -5,9 +5,9 @@ module Agda.TypeChecking.Quote where
 import Control.Monad
 
 import Data.Maybe (fromMaybe)
-import qualified Data.Text as T
+import Data.Text qualified as T
 
-import qualified Agda.Syntax.Abstract as A
+import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Common
 import Agda.Syntax.Internal as I
 import Agda.Syntax.Internal.Pattern ( hasDefP )
@@ -23,27 +23,25 @@ import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Substitute
 
 import Agda.Utils.Impossible
-import Agda.Utils.Functor
 import Agda.Utils.List
-import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Utils.Size
+import Agda.Utils.Maybe.Strict qualified as Strict
 
 -- | Parse @quote@.
 quotedName :: (MonadTCError m, MonadAbsToCon m) => A.Expr -> m QName
 quotedName = \case
-  A.Var x          -> genericError $ "Cannot quote a variable " ++ prettyShow x
-  A.Def x          -> return x
-  A.Macro x        -> return x
-  A.Proj _o p      -> unambiguous p
-  A.Con c          -> unambiguous c
-  A.ScopedExpr _ e -> quotedName e
-  e -> genericDocError =<< do
-    text "Can only quote defined names, but encountered" <+> prettyA e
+  -- Andreas, 2024-09-27, issue #7514
+  -- Is it intended to be able to quote Set but not Set1?
+  A.Def' x NoSuffix -> return x
+  A.Macro x         -> return x
+  A.Proj _o p       -> unambiguous p
+  A.Con c           -> unambiguous c
+  A.ScopedExpr _ e  -> quotedName e
+  e -> typeError $ CannotQuote $ CannotQuoteExpression e
   where
-  unambiguous xs
-    | Just x <- getUnambiguous xs = return x
-    | otherwise =
-        genericError $ "quote: Ambigous name: " ++ prettyShow (unAmbQ xs)
+    unambiguous ambX = case getUnambiguous ambX of
+      Just x  -> return x
+      Nothing -> typeError $ CannotQuote $ CannotQuoteAmbiguous ambX
 
 
 data QuotingKit = QuotingKit
@@ -129,9 +127,10 @@ quotingKit = do
       quoteHiding NotHidden  = pure visible
 
       quoteRelevance :: Relevance -> ReduceM Term
-      quoteRelevance Relevant   = pure relevant
-      quoteRelevance Irrelevant = pure irrelevant
-      quoteRelevance NonStrict  = pure relevant
+      quoteRelevance = \case
+        Relevant        {} -> pure relevant
+        Irrelevant      {} -> pure irrelevant
+        ShapeIrrelevant {} -> pure relevant
 
       quoteQuantity :: Quantity -> ReduceM Term
       quoteQuantity (Quantity0 _) = pure quantity0
@@ -179,8 +178,8 @@ quotingKit = do
       quoteSort PiSort{} = pure unsupportedSort
       quoteSort FunSort{} = pure unsupportedSort
       quoteSort UnivSort{}   = pure unsupportedSort
-      quoteSort (MetaS x es) = quoteTerm $ MetaV x es
-      quoteSort (DefS d es)  = quoteTerm $ Def d es
+      quoteSort (MetaS x es) = pure unsupportedSort
+      quoteSort (DefS d es)  = pure unsupportedSort
       quoteSort (DummyS s)   =__IMPOSSIBLE_VERBOSE__ s
 
       quoteType :: Type -> ReduceM Term
@@ -224,8 +223,8 @@ quotingKit = do
       quoteTelescope tel = quoteList quoteTelEntry $ telToList tel
 
       quoteTelEntry :: Dom (ArgName, Type) -> ReduceM Term
-      quoteTelEntry dom@Dom{ unDom = (x , t) } = do
-        SigmaKit{..} <- fromMaybe __IMPOSSIBLE__ <$> getSigmaKit
+      quoteTelEntry dom@(unDom -> (x , t)) = do
+        SigmaKit{ sigmaCon } <- fromMaybe __IMPOSSIBLE__ <$> getSigmaKit
         Con sigmaCon ConOSystem [] !@! quoteString x @@ quoteDom quoteType (fmap snd dom)
 
       list :: [ReduceM Term] -> ReduceM Term
@@ -235,7 +234,7 @@ quotingKit = do
       quoteList q xs = list (map q xs)
 
       quoteDom :: (a -> ReduceM Term) -> Dom a -> ReduceM Term
-      quoteDom q Dom{domInfo = info, unDom = t} = arg !@ quoteArgInfo info @@ q t
+      quoteDom q d@(unDom -> t) = arg !@ quoteArgInfo (d ^. dInfo) @@ q t
 
       quoteAbs :: Subst a => (a -> ReduceM Term) -> Abs a -> ReduceM Term
       quoteAbs q (Abs s t)   = abs !@! quoteString s @@ q t
@@ -262,12 +261,16 @@ quotingKit = do
           Lam info t -> lam !@ quoteHiding (getHiding info) @@ quoteAbs quoteTerm t
           Def x es   -> do
             defn <- getConstInfo x
+            patlams <- viewTC ePrintingPatternLambdas
+            let isSeenPatLam = elem x patlams
             r <- isReconstructed
             -- #2220: remember to restore dropped parameters
             let
               conOrProjPars = defParameters defn r
               ts = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
-              qx Function{ funExtLam = Just (ExtLamInfo m False _), funClauses = cs } = do
+              qx Function{ funExtLam = Just (ExtLamInfo m False Strict.Nothing), funClauses = cs }
+                | not isSeenPatLam = locallyTC ePrintingPatternLambdas (x :) $ do
+
                     -- An extended lambda should not have any extra parameters!
                     unless (null conOrProjPars) __IMPOSSIBLE__
                     cs <- return $ filter (not . generatedClause) cs
@@ -275,7 +278,8 @@ quotingKit = do
                     let (pars, args) = splitAt n ts
                     extlam !@ list (map (quoteClause (Left ()) . (`apply` pars)) cs)
                            @@ list (map (quoteArg quoteTerm) args)
-              qx df@Function{ funExtLam = Just (ExtLamInfo _ True _), funCompiled = Just Fail{}, funClauses = [cl] } = do
+              qx df@Function{ funExtLam = Just (ExtLamInfo _ True Strict.Nothing), funCompiled = Just Fail{}, funClauses = [cl] }
+                | not isSeenPatLam = locallyTC ePrintingPatternLambdas (x :) $ do
                     -- See also corresponding code in InternalToAbstract
                     let n = length (namedClausePats cl) - 1
                         pars = take n ts
@@ -302,16 +306,13 @@ quotingKit = do
                               @@ quoteArgs vs
             where vs = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
           DontCare u -> quoteTerm u
-          Dummy s _  -> __IMPOSSIBLE_VERBOSE__ s
+          Dummy s _  -> __IMPOSSIBLE_VERBOSE__ (show s)
 
       defParameters :: Definition -> Bool -> [ReduceM Term]
       defParameters def True  = []
       defParameters def False = map par hiding
         where
-          np = case theDef def of
-                 Constructor{ conPars = np }         -> np
-                 Function{ funProjection = Right p } -> projIndex p - 1
-                 _                                   -> 0
+          np         = droppedPars def
           TelV tel _ = telView' (defType def)
           hiding     = take np $ telToList tel
           par d      = arg !@ quoteArgInfo (domInfo d)
@@ -339,8 +340,9 @@ quotingKit = do
             agdaDefinitionFunDef !@ quoteList (quoteClause (Left ())) cs
           Primitive{}   -> pure agdaDefinitionPrimitive
           PrimitiveSort{} -> pure agdaDefinitionPrimitive
-          Constructor{conData = d} ->
-            agdaDefinitionDataConstructor !@! quoteName d
+          Constructor{conData = d, conSrcCon = c} -> do
+            q <- getQuantity <$> getConstInfo (conName c)
+            agdaDefinitionDataConstructor !@! quoteName d @@ quoteQuantity q
 
   return $ QuotingKit quoteTerm quoteType (quoteDom quoteType) quoteDefn quoteList
 

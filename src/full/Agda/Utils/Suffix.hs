@@ -3,7 +3,7 @@
 module Agda.Utils.Suffix where
 
 import Data.Char
-import qualified Data.List as List
+import Data.List qualified as List
 
 import Agda.Utils.Impossible
 
@@ -54,7 +54,7 @@ nextSuffix (Subscript i) = Subscript $ i + 1
 
 suffixView :: String -> (String, Maybe Suffix)
 suffixView s
-    | (ps@(_:_), s') <- span (=='\'') rs         = (reverse s', Just $ Prime $ List.genericLength ps)
+    | (ps@(_:_), s') <- span (== '\'') rs        = (reverse s', Just $ Prime $ List.genericLength ps)
     | (ns@(_:_), s') <- span isDigit rs          = (reverse s', Just $ Index $ read $ reverse ns)
     | (ns@(_:_), s') <- span isSubscriptDigit rs = (reverse s', Just $ Subscript $ read $
                                                       map fromSubscriptDigit $ reverse ns)

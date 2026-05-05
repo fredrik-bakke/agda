@@ -5,7 +5,6 @@ import Control.DeepSeq
 
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.Semigroup
 
 import GHC.Generics (Generic)
 
@@ -13,7 +12,8 @@ import Agda.Syntax.Common
 import Agda.Syntax.Abstract.Name (QName)
 import Agda.Syntax.Internal.Elim
 
-import Agda.Syntax.Common.Pretty hiding ((<>))
+import Agda.Syntax.Common.Pretty
+import Agda.Utils.List
 import Agda.Utils.Functor
 
 ---------------------------------------------------------------------------
@@ -61,13 +61,21 @@ instance Monoid (NotBlocked' t) where
 
 instance NFData t => NFData (NotBlocked' t)
 
+instance Pretty t => Pretty (NotBlocked' t) where
+  pretty = \case
+    StuckOn e        -> "elimination" <+> pretty e
+    Underapplied     -> "missing elimination (underapplied)"
+    AbsurdMatch      -> "absurd match"
+    MissingClauses x -> "missing clause for" <+> pretty x
+    ReallyNotBlocked -> "(not stuck)"
+
 -- | What is causing the blocking? Or in other words which metas or problems need to be solved to
 --   unblock the blocked computation/constraint.
-data Blocker = UnblockOnAll (Set Blocker)
-             | UnblockOnAny (Set Blocker)
-             | UnblockOnMeta MetaId     -- ^ Unblock if meta is instantiated
-             | UnblockOnProblem ProblemId
-             | UnblockOnDef QName       -- ^ Unblock when function is defined
+data Blocker = UnblockOnAll !(Set Blocker)
+             | UnblockOnAny !(Set Blocker)
+             | UnblockOnMeta {-# UNPACK #-} !MetaId     -- ^ Unblock if meta is instantiated
+             | UnblockOnProblem !ProblemId
+             | UnblockOnDef !QName       -- ^ Unblock when function is defined
   deriving (Show, Eq, Ord, Generic)
 
 instance NFData Blocker
@@ -84,7 +92,7 @@ unblockOnAll us =
     us | [u] <- Set.toList us -> u
     us                        -> UnblockOnAll us
   where
-    allViewS = Set.unions . map allView . Set.toList
+    allViewS = Set.unions . map' allView . Set.toList
     allView (UnblockOnAll us) = allViewS us
     allView u                 = Set.singleton u
 
@@ -95,7 +103,7 @@ unblockOnAny us =
     us | Set.member alwaysUnblock us -> alwaysUnblock
        | otherwise                   -> UnblockOnAny us
   where
-    anyViewS = Set.unions . map anyView . Set.toList
+    anyViewS = Set.unions . map' anyView . Set.toList
     anyView (UnblockOnAny us) = anyViewS us
     anyView u                 = Set.singleton u
 
@@ -128,22 +136,22 @@ onBlockingMetasM f b@UnblockOnProblem{} = pure b
 onBlockingMetasM f b@UnblockOnDef{}     = pure b
 
 allBlockingMetas :: Blocker -> Set MetaId
-allBlockingMetas (UnblockOnAll us)  = Set.unions $ map allBlockingMetas $ Set.toList us
-allBlockingMetas (UnblockOnAny us)  = Set.unions $ map allBlockingMetas $ Set.toList us
+allBlockingMetas (UnblockOnAll us)  = Set.unions $ map' allBlockingMetas $ Set.toList us
+allBlockingMetas (UnblockOnAny us)  = Set.unions $ map' allBlockingMetas $ Set.toList us
 allBlockingMetas (UnblockOnMeta x)  = Set.singleton x
 allBlockingMetas UnblockOnProblem{} = Set.empty
 allBlockingMetas UnblockOnDef{}     = Set.empty
 
 allBlockingProblems :: Blocker -> Set ProblemId
-allBlockingProblems (UnblockOnAll us)    = Set.unions $ map allBlockingProblems $ Set.toList us
-allBlockingProblems (UnblockOnAny us)    = Set.unions $ map allBlockingProblems $ Set.toList us
+allBlockingProblems (UnblockOnAll us)    = Set.unions $ map' allBlockingProblems $ Set.toList us
+allBlockingProblems (UnblockOnAny us)    = Set.unions $ map' allBlockingProblems $ Set.toList us
 allBlockingProblems UnblockOnMeta{}      = Set.empty
 allBlockingProblems (UnblockOnProblem p) = Set.singleton p
 allBlockingProblems UnblockOnDef{}       = Set.empty
 
 allBlockingDefs :: Blocker -> Set QName
-allBlockingDefs (UnblockOnAll us)  = Set.unions $ map allBlockingDefs $ Set.toList us
-allBlockingDefs (UnblockOnAny us)  = Set.unions $ map allBlockingDefs $ Set.toList us
+allBlockingDefs (UnblockOnAll us)  = Set.unions $ map' allBlockingDefs $ Set.toList us
+allBlockingDefs (UnblockOnAny us)  = Set.unions $ map' allBlockingDefs $ Set.toList us
 allBlockingDefs UnblockOnMeta{}    = Set.empty
 allBlockingDefs UnblockOnProblem{} = Set.empty
 allBlockingDefs (UnblockOnDef q)   = Set.singleton q
@@ -159,8 +167,8 @@ instance Monoid Blocker where
 -}
 
 instance Pretty Blocker where
-  pretty (UnblockOnAll us)      = "all" <> parens (fsep $ punctuate "," $ map pretty $ Set.toList us)
-  pretty (UnblockOnAny us)      = "any" <> parens (fsep $ punctuate "," $ map pretty $ Set.toList us)
+  pretty (UnblockOnAll us)      = "all" <> parens (fsep $ punctuate "," $ map' pretty $ Set.toList us)
+  pretty (UnblockOnAny us)      = "any" <> parens (fsep $ punctuate "," $ map' pretty $ Set.toList us)
   pretty (UnblockOnMeta m)      = pretty m
   pretty (UnblockOnProblem pid) = "problem" <+> pretty pid
   pretty (UnblockOnDef q)       = "definition" <+> pretty q
@@ -187,7 +195,7 @@ instance Semigroup a => Semigroup (Blocked' t a) where
   NotBlocked{}   <> b@Blocked{}    = b
   NotBlocked x a <> NotBlocked y b = NotBlocked (x <> y) (a <> b)
 
-instance (Semigroup a, Monoid a) => Monoid (Blocked' t a) where
+instance (Monoid a) => Monoid (Blocked' t a) where
   mempty = notBlocked mempty
   mappend = (<>)
 

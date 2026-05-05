@@ -1,0 +1,7 @@
+ProjPDisplay.agda:44.7-11: error: [UnequalTerms]
+The terms
+  g x
+and
+  Equiv.from f x
+are not equal at type A
+when checking that the expression refl has type g ≡ Equiv.from f

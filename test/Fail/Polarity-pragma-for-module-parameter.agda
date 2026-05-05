@@ -1,5 +1,5 @@
-{-# OPTIONS --warning=error #-}
 
-module _ (A : Set) where
 
-{-# POLARITY A #-}
+module _ (F : Set → Set) where
+
+{-# POLARITY F + #-}

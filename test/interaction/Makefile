@@ -3,7 +3,14 @@ TOP = ../..
 include $(TOP)/mk/paths.mk
 
 # Extra options when running agda --interaction
-AGDA_OPT=--no-default-libraries
+# Andreas, 2025-08-05, PR #8047:
+# Add --color=never to turn off highlighting info sent to the Agda information buffer.
+# Highlighting information for the info buffer is not portable
+# since its position info varies with the length of filepaths.
+# As they are absolute, they have different length locally and on CI.
+# So, we do not want this highlighting information in the golden values
+# until someone finishes #6192.
+AGDA_OPT=--no-default-libraries --color=never
 
 # Get the current directory (OS dependent).
 uname:=$(shell uname)
@@ -141,9 +148,15 @@ $(Tests) : %.cmp : %.out
 			cat $*.tmp; \
 			echo "=== Diff ==="; \
 			(  git diff --no-index --no-ext-diff -w $*.out $*.tmp || true  ) ; \
-			echo -n "Accept new error [y/n/Q] (default: no)? "; \
-			read -n 1; \
-			echo ""; \
+			while true; do \
+				echo -n "Accept new error [y/n/Q] (default: no)? "; \
+				read -n 1; \
+				echo ""; \
+				case "$$REPLY" in \
+					y|n|Q|"") break;; \
+					*) echo "Invalid input. Please enter y, n, Q, or press Enter.";; \
+				esac; \
+			done; \
 			if [ "fckShPrg$$REPLY" != "fckShPrgy"  ]; \
 			  then echo "Keeping old output"; \
 			       rm -f $*.tmp; \

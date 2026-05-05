@@ -14,7 +14,7 @@ import Agda.Syntax.Position
 import Agda.Syntax.Common
 import Agda.Syntax.Literal
 import Agda.Syntax.Fixity
-import Agda.Syntax.Internal as I
+import Agda.Syntax.Internal as I hiding (ConName)
 import qualified Agda.Syntax.Concrete.Name as C
 
 import Agda.TypeChecking.Free
@@ -22,6 +22,7 @@ import Agda.TypeChecking.Substitute
 
 import qualified Agda.Utils.VarSet as Set
 
+import Agda.Utils.Lens
 import Agda.Utils.Impossible
 
 import Internal.Helpers hiding ( Args )
@@ -126,7 +127,7 @@ isntTypeConf :: TermConfiguration -> TermConfiguration
 isntTypeConf conf = conf { tcIsType = False }
 
 extendConf :: TermConfiguration -> TermConfiguration
-extendConf conf = conf { tcFreeVariables = 0 : map (1+) (tcFreeVariables conf) }
+extendConf conf = conf { tcFreeVariables = 0 : map (1 +) (tcFreeVariables conf) }
 
 extendWithTelConf :: Telescope -> TermConfiguration -> TermConfiguration
 extendWithTelConf tel conf = foldr (const extendConf) conf (telToList tel)
@@ -151,10 +152,10 @@ makeConfiguration ds cs ps vs = TermConf
       n <- tick
       return $ QName { qnameModule = MName []
                      , qnameName   = Name
-                        { nameId          = NameId n (ModuleNameHash 1)
+                        { _nameId         = NameId n (ModuleNameHash 1)
                         , nameConcrete    = C.simpleName s
                         , nameCanonical   = C.simpleName s
-                        , nameBindingSite = noRange
+                        , _nameBindingSite = noRange
                         , nameFixity      = noFixity'
                         , nameIsRecordName = False
                         }
@@ -451,7 +452,9 @@ instance ShrinkC a => ShrinkC (Arg a) where
 
 instance ShrinkC a => ShrinkC (Dom a) where
   type ShrinksTo (Dom a) = Dom (ShrinksTo a)
-  shrinkC conf dom@Dom{domInfo = info,unDom = x} = (\ (h,x) -> x <$ dom{domInfo = (setHiding h info)}) <$> shrinkC conf (argInfoHiding info, x)
+  shrinkC conf dom@(unDom -> x) =
+    let info = dom ^. I.dInfo in
+    (\ (h,x) -> x <$ (dom & I.dInfo .~ setHiding h info)) <$> shrinkC conf (argInfoHiding info, x)
   noShrink = fmap noShrink
 
 instance ShrinkC a => ShrinkC (Blocked a) where
@@ -586,7 +589,7 @@ instance (KillVar a, KillVar b) => KillVar (a, b) where
 -- Tests ------------------------------------------------------------------
 
 isWellScoped :: Free a => TermConfiguration -> a -> Bool
-isWellScoped conf t = allFreeVars t `Set.isSubsetOf` Set.fromList (tcFreeVariables conf)
+isWellScoped conf t = freeVarSet t `Set.isSubsetOf` Set.fromList (tcFreeVariables conf)
 
 -- | Check that the generated terms don't have any out of scope variables.
 prop_wellScopedVars :: TermConfiguration -> Property

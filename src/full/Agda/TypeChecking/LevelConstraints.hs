@@ -3,7 +3,7 @@
 module Agda.TypeChecking.LevelConstraints ( simplifyLevelConstraint ) where
 
 import qualified Data.List as List
-import Data.Maybe
+
 import Agda.Syntax.Internal
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Substitute
@@ -11,7 +11,8 @@ import Agda.TypeChecking.Free
 import Agda.TypeChecking.Level
 
 import Agda.Utils.Impossible
-import Agda.Utils.List (nubOn)
+import Agda.Utils.List
+import Agda.Utils.List1 (List1)
 import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Update
 
@@ -24,7 +25,7 @@ import Agda.Utils.Update
 --   takes care of renaming variables when checking for matches.
 simplifyLevelConstraint
   :: Constraint          -- ^ Constraint @c@ to simplify.
-  -> [Constraint]        -- ^ Other constraints, enable simplification.
+  -> List1 Constraint    -- ^ Other constraints, enable simplification.
   -> Maybe [Constraint]  -- ^ @Just@: list of constraints equal to the original @c@.
                          --   @Nothing@: no simplification possible.
 simplifyLevelConstraint c others = do
@@ -38,10 +39,12 @@ simplifyLevelConstraint c others = do
     simpl (a :=< b)
       | any (matchLeq (b :=< a)) leqs = dirty  $ LevelCmp CmpEq  (unSingleLevel a) (unSingleLevel b)
       | otherwise                     = return $ LevelCmp CmpLeq (unSingleLevel a) (unSingleLevel b)
-    leqs = concat $ mapMaybe inequalities others
+    leqs = concat $ List1.mapMaybe inequalities others
 
 data Leq = SingleLevel :=< SingleLevel
   deriving (Show, Eq)
+
+{-# SPECIALIZE freeVarList :: (SingleLevel, SingleLevel) -> [Int] #-}
 
 -- | Check if two inequality constraints are the same up to variable renaming.
 matchLeq :: Leq -> Leq -> Bool
@@ -49,11 +52,9 @@ matchLeq (a :=< b) (c :=< d)
   | length xs == length ys = (a, b) == applySubst rho (c, d)
   | otherwise              = False
   where
-    free :: Free a => a -> [Int]
-    free = nubOn id . runFree (:[]) IgnoreNot  -- Note: use a list to preserve order of variables
-    xs  = free (a, b)
-    ys  = free (c, d)
-    rho = mkSub $ List.sort $ zip ys xs
+    xs  = nubOn id . freeVarList $ (a, b) -- Note: use a list to preserve order of variables
+    ys  = nubOn id . freeVarList $ (c, d)
+    rho = mkSub $ List.sort $ zip' ys xs
     mkSub = go 0
       where
         go _ [] = IdS
@@ -67,7 +68,7 @@ matchLeq (a :=< b) (c :=< d)
 inequalities :: Constraint -> Maybe [Leq]
 
 inequalities (LevelCmp CmpLeq a b)
-  | Just b' <- singleLevelView b = Just $ map (:=< b') $ List1.toList $ levelMaxView a
+  | Just b' <- singleLevelView b = Just $! map' (:=< b') $ List1.toList $ levelMaxView a
   -- Andreas, 2016-09-28
   -- Why was this most natural case missing?
   -- See test/Succeed/LevelLeqGeq.agda for where it is useful!
@@ -78,12 +79,12 @@ inequalities (LevelCmp CmpLeq a b)
 inequalities (LevelCmp CmpEq a b)
   | Just a' <- singleLevelView a =
   case List1.break (== a') (levelMaxView b) of
-    (bs0, _ : bs1) -> Just [ b' :=< a' | b' <- bs0 ++ bs1 ]
+    (bs0, _ : bs1) -> Just $! map' (\b' -> b' :=< a') (bs0 ++! bs1)
     _              -> Nothing
 
 inequalities (LevelCmp CmpEq a b)
   | Just b' <- singleLevelView b =
   case List1.break (== b') (levelMaxView a) of
-    (as0, _ : as1) -> Just [ a' :=< b' | a' <- as0 ++ as1 ]
+    (as0, _ : as1) -> Just $! map' (\a' -> a' :=< b') (as0 ++! as1)
     _              -> Nothing
 inequalities _ = Nothing

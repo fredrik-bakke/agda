@@ -174,7 +174,7 @@ Instead, you can use copattern matching:
     cycle a .hd = a
     cycle a .tl = cycle a
 
-It is also possible to use copattern-matching lambdas:
+It is also possible to use copatterns in a :ref:`pattern-lambda`:
 
 ::
 
@@ -186,6 +186,36 @@ It is also possible to use copattern-matching lambdas:
 
 For more information on these restrictions, see `this pull request <https://github.com/agda/agda/pull/4611>`_,
 and `this commit <https://github.com/agda/agda/commit/d771ac257ee9a1f9662364e5db8a50f9994dac49>`_.
+
+.. _eta-pragma:
+
+The ``ETA_EQUALITY`` pragma
+___________________________
+
+Agda does not permit the ``eta-equality`` directive in ``coinductive`` ``record`` declarations,
+since η for coinductive types is unsafe in general and can make the type checker loop.
+For instance, the following code would lead to infinite η expansion when checking ``test``:
+
+.. code-block:: agda
+
+  record R : Set where
+   coinductive; eta-equality
+   field force : R
+  open R
+
+  foo : R
+  foo .force .force = foo
+
+  test : foo .force ≡ foo
+  test = refl
+
+If you know what you are doing, you can override Agda and force a coinductive record to support η via the ``ETA_EQUALITY`` pragma.
+
+.. code-block:: agda
+
+  {-# ETA_EQUALITY #-}
+  record R : Set where
+    ...
 
 .. _old-coinduction:
 

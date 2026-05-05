@@ -1,3 +1,7 @@
-Issue3807.agda:15,45-48
-y != x of type A
+Issue3807.agda:15.45-48: error: [UnequalTerms]
+The terms
+  y
+and
+  x
+are not equal at type A
 when checking that the expression f y has type P (c x)

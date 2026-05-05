@@ -4,7 +4,6 @@
 module Agda.Syntax.Internal.SanityCheck where
 
 import Control.Monad
-import qualified Data.IntSet as Set
 
 import Agda.Syntax.Internal
 import Agda.TypeChecking.Free
@@ -14,14 +13,15 @@ import Agda.Utils.List ( dropEnd, initWithDefault )
 import Agda.Syntax.Common.Pretty
 import Agda.Utils.Size
 import Agda.Utils.Impossible
+import qualified Agda.Utils.VarSet as VarSet
 
 
 sanityCheckVars :: (Pretty a, Free a) => Telescope -> a -> TCM ()
 sanityCheckVars tel v =
-  case filter bad (Set.toList $ allFreeVars v) of
+  case filter bad (VarSet.toAscList $ freeVarSet v) of
     [] -> return ()
     xs -> do
-      reportSDoc "impossible" 1 . return $
+      alwaysReportSDoc "impossible" 1 . return $
         sep [ hang "Sanity check failed for" 2
                    (hang (pretty tel <+> "|-") 2 (pretty v))
             , text $ "out of scope: " ++ show xs ]
@@ -70,7 +70,7 @@ sanityCheckSubst gamma rho delta = go gamma rho delta
     dropLastN n = telFromList . dropEnd n . telToList
 
     err reason = do
-      reportSDoc "impossible" 1 . return $
+      alwaysReportSDoc "impossible" 1 . return $
         sep [ hang "Sanity check failed for" 2 $
               hang (pretty gamma <+> "|-") 2 $
               hang (pretty rho <+> ":") 2 $

@@ -30,12 +30,15 @@ Language Reference
    let-and-where
    lexical-structure
    literal-overloading
+   local-rewriting
    lossy-unification
    mixfix-operators
+   modalities
    module-system
    mutual-recursion
    opaque-definitions
    pattern-synonyms
+   polarity
    positivity-checking
    postulates
    pragmas

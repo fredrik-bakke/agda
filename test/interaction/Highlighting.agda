@@ -1,4 +1,5 @@
 {-# OPTIONS --cohesion --erasure --guarded #-}
+{-# OPTIONS -WnoEmptyPrivate #-}
 
 module Highlighting where
 
@@ -225,3 +226,68 @@ module Issue4743 where
       A = Set
 
   module @0 M₂ = M₁
+
+-- Andreas, 2024-03-26, issue #7202
+-- Precise range for warning ModuleDoesntExport:
+-- only highlight identifiers that cannot be imported.
+
+module Issue7202 where
+
+  open Issue4743 using
+    ( D₃
+    ; D₀  -- this should have deadcode highlighting
+    ; D₁
+    ; D₄  -- this should have deadcode highlighting
+    ; D₂
+    )
+
+open import Agda.Builtin.Bool
+
+module ExactSplit where
+
+  isZero : Nat → Bool
+  isZero 0 = true
+  isZero _ = false  -- This should have smoke highlighting (no exact split)
+
+-- Andreas, 2024-12-07, issue #7641
+
+module Issue7641 where
+
+  record R7641 : Set where
+    field f7641 : Set
+
+  -- There should be a error-warning highlighting
+  -- since the field is too big for the record.
+
+private -- No highlighting as warning is disabled.
+  -- Triggers warning EmptyPrivate, but the warning is disabled.
+
+module Issue7851 where
+
+  postulate Atom : Set
+  {-# POLARITY Atom ++ - #-}
+
+module MissingRecordFields where
+
+  record ABC : Set₂ where
+    field
+      A B C : Set₁
+
+  test : ABC
+  test = record  -- should only highlight the record keyword in yellow
+    { A = Set
+    -- ; B = _   -- this missing field produces an unsolved meta
+    ; C = Set
+    }
+
+module Issue8400 where
+
+  data Foo : Nat → Set where
+    instance                                -- should be highlighted
+      ze : Foo zero
+      su : {n : Nat} → Foo n → Foo (suc n)  -- su should be highlighted
+
+  -- warning: -W[no]InstanceWithExplicitArg
+  -- Instance declarations with explicit arguments are never considered
+  -- by instance search, so making su into an instance has no effect.
+  -- when checking the constructor su in the declaration of Foo

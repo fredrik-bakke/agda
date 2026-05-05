@@ -1,15 +1,12 @@
-{-# LANGUAGE CPP          #-}
 
 -- | Tree traversal for internal syntax.
 
 module Agda.Syntax.Internal.Generic where
 
-#if __GLASGOW_HASKELL__ < 804
-import Data.Monoid ((<>))
-#endif
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
 import Agda.Utils.Functor
+import Agda.Utils.List1 (List1)
 
 -- | Generic term traversal.
 --
@@ -59,8 +56,9 @@ instance TermLike QName where
 
 instance TermLike a => TermLike (Elim' a)      where
 instance TermLike a => TermLike (Arg a)        where
-instance TermLike a => TermLike (Dom a)        where
+instance (TermLike a, TermLike b) => TermLike (Dom' a b) where
 instance TermLike a => TermLike [a]            where
+instance TermLike a => TermLike (List1 a)      where
 instance TermLike a => TermLike (Maybe a)      where
 instance TermLike a => TermLike (Blocked a)    where
 instance TermLike a => TermLike (Abs a)        where
@@ -119,7 +117,7 @@ instance TermLike PlusLevel where
   traverseTermM f (Plus n l) = Plus n <$> traverseTermM f l
   foldTerm f (Plus _ l)      = foldTerm f l
 
-instance TermLike Type where
+instance (TermLike b) => TermLike (Type'' a b) where
   traverseTermM f (El s t) = El s <$> traverseTermM f t
   foldTerm f (El s t) = foldTerm f t
 
@@ -159,7 +157,7 @@ instance TermLike EqualityView where
       <$> traverseTermM f t
     IdiomType t -> IdiomType
       <$> traverseTermM f t
-    EqualityType s eq l t a b -> EqualityType s eq
+    EqualityType r s eq l t a b -> EqualityType r s eq
       <$> traverse (traverseTermM f) l
       <*> traverseTermM f t
       <*> traverseTermM f a
@@ -168,7 +166,7 @@ instance TermLike EqualityView where
   foldTerm f = \case
     OtherType t -> foldTerm f t
     IdiomType t -> foldTerm f t
-    EqualityType s eq l t a b -> foldTerm f (l ++ [t, a, b])
+    EqualityType _r _s _eq l t a b -> foldTerm f (l ++ [t, a, b])
 
 -- | Put it in a monad to make it possible to do strictly.
 copyTerm :: (TermLike a, Monad m) => a -> m a

@@ -1,4 +1,3 @@
-{-# LANGUAGE DoAndIfThenElse   #-}
 
 module LaTeXAndHTML.Tests where
 
@@ -12,6 +11,7 @@ import qualified Data.Text as T
 
 import qualified Network.URI.Encode
 import System.Directory
+import System.Environment (getEnvironment)
 import System.Exit
 import System.FilePath
 import System.IO.Temp
@@ -73,7 +73,7 @@ latexTests = [ disable "LaTeXAndHTML/.*LaTeX/.*" ]
 --
 tests :: IO TestTree
 tests = do
-  agdaBin  <- getAgdaBin
+  agdaBin  <- getAgdaBin <$> getEnvironment
   suiteTests <- concat <$> mapM (taggedListOfAllTests agdaBin) testDirs
   let allTests = suiteTests ++ userManualTests agdaBin
   let (html, latex, quicklatex) = (\ f -> partition3 (f . fst) allTests) $ \case
@@ -147,6 +147,8 @@ mkLaTeXOrHTMLTest k copy agdaBin testDir inp =
                   then "rst"
                   else if "OrgHighlight" `List.isPrefixOf` inFileName
                   then "org"
+                  else if "TreeHighlight" `List.isPrefixOf` inFileName
+                  then "tree"
                   else "html"
 
   flags :: FilePath -> [String]
@@ -232,10 +234,11 @@ mkLaTeXOrHTMLTest k copy agdaBin testDir inp =
       -> IO LaTeXResult
   runLaTeX texFile wd cont prog = do
       let proc' = (proc prog ["-interaction=errorstopmode", texFile]) { cwd = Just wd }
-      (ret, _, _) <- PB.readCreateProcessWithExitCode proc' BS.empty
+      (ret, out, _) <- PB.readCreateProcessWithExitCode proc' BS.empty
       if ret == ExitSuccess then
         cont
       else do
+        BS.putStr out
         r <- cont
         return $ case r of
           LaTeXFailed progs -> LaTeXFailed (prog : progs)

@@ -1,6 +1,6 @@
 ..
   ::
-  {-# OPTIONS --guardedness #-}
+  {-# OPTIONS --guardedness --no-require-unique-meta-solutions #-}
   module language.pragmas where
 
 .. _pragmas:
@@ -9,8 +9,9 @@
 Pragmas
 *******
 
-Pragmas are comments that are not ignored by Agda but have some
-special meaning. The general format is:
+Pragmas are special declarations that pass extra information to Agda about how regular declarations are to be interpreted.
+They are written similar to block comments so that users may easily skip them in a first reading of an Agda document.
+The general format is:
 
 .. code-block:: agda
 
@@ -27,9 +28,13 @@ Index of pragmas
 
 * :ref:`DISPLAY <display-pragma>`
 
+* :ref:`ETA_EQUALITY <eta-pragma>`
+
 * :ref:`FOREIGN <foreign-function-interface>`
 
 * :ref:`INJECTIVE <injective-pragma>`
+
+* :ref:`INJECTIVE_FOR_INFERENCE <injective-for-inference-pragma>`
 
 * :ref:`INLINE <inline-pragma>`
 
@@ -102,6 +107,7 @@ Limitations:
     when Agda tries to use it
     (issue `#6476 <https://github.com/agda/agda/issues/6476>`).
 
+
 .. _injective-pragma:
 
 The ``INJECTIVE`` pragma
@@ -128,6 +134,54 @@ Example::
 
 Aside from datatypes, this pragma can also be used to mark other
 definitions as being injective (for example postulates).
+
+At the moment it only gives you propositional injectivity,
+so you can pattern match on a proof of `Fin x ≡ Fin y` in example above,
+but does not give you definitional injectivity,
+so the constraint solver does not know how to solve the constraint `Fin x = Fin _`.
+Relevant issue: https://github.com/agda/agda/issues/4106#issuecomment-534904561
+
+.. _injective-for-inference-pragma:
+
+The ``INJECTIVE_FOR_INFERENCE`` pragma
+______________________________________
+
+Treats functions as injective for type inference. This behaves like a
+local version of :option:`--lossy-unification` and has the same
+potential issues. Since Agda can not always infer whether a function
+is injective it can be used to get stronger unification for those
+functions.
+
+The option :option:`--no-require-unique-meta-solutions` needs to be active
+in the file where the function is used, but not necessarily in the file it is
+defined. When solving a constraint involving the function in a file where
+:option:`--require-unique-meta-solutions` is in effect, the pragma is ignored.
+
+..
+  ::
+  module InjectiveForInference where
+
+Example::
+
+   open import Agda.Builtin.Equality
+   open import Agda.Builtin.List
+
+   module _ {A : Set} where
+     _++_ : List A → List A → List A
+     []       ++ ys = ys
+     (x ∷ xs) ++ ys = x ∷ (xs ++ ys)
+
+     reverse : List A → List A
+     reverse []      = []
+     reverse (x ∷ l) = reverse l ++ (x ∷ [])
+
+     {-# INJECTIVE_FOR_INFERENCE reverse #-}
+
+     reverse-≡ : {l l' : List A} → reverse l ≡ reverse l' → reverse l ≡ reverse l'
+     reverse-≡ h = h
+
+     []≡[] : {l l' : List A} → [] ≡ []
+     []≡[] = reverse-≡ (refl {x = reverse []})
 
 .. _inline-pragma:
 
@@ -166,7 +220,7 @@ Inlining constructor right-hand sides
 
 .. versionadded:: 2.6.4
 
-Constructors can also be marked ``INLINE`` (for types supporting co-pattern matching)::
+Constructors can also be marked ``INLINE`` (for types supporting copattern matching)::
 
   record Stream (A : Set) : Set where
     coinductive; constructor _∷_
@@ -175,7 +229,7 @@ Constructors can also be marked ``INLINE`` (for types supporting co-pattern matc
   open Stream
   {-# INLINE _∷_ #-}
 
-Functions definitions using these constructors will be translated to use co-pattern matching instead, e.g.::
+Functions definitions using these constructors will be translated to use copattern matching instead, e.g.::
 
   nats : Nat → Stream Nat
   nats n = n ∷ nats (1 + n)

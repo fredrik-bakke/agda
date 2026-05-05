@@ -2,7 +2,8 @@
 
 module Internal.TypeChecking.Positivity.Occurrence ( tests ) where
 
-import Agda.TypeChecking.Positivity.Occurrence
+import Agda.TypeChecking.Positivity.Occurrence (Occurrence(..))
+import Agda.TypeChecking.Positivity.Warnings
 import Agda.Utils.SemiRing
 import Agda.Utils.List ( uniqOn )
 
@@ -30,7 +31,7 @@ instance Arbitrary Where where
     [ return LeftOfArrow
     , DefArg <$> arbitrary <*> arbitrary
     , return UnderInf
-    , return VarArg
+    , VarArg <$> arbitrary <*> arbitrary
     , return MetaArg
     , ConArgType <$> arbitrary
     , IndArgType <$> arbitrary
@@ -47,7 +48,7 @@ instance CoArbitrary Where where
   coarbitrary LeftOfArrow    = variant 0
   coarbitrary (DefArg a b)   = variant 1 . coarbitrary (a, b)
   coarbitrary UnderInf       = variant 2
-  coarbitrary VarArg         = variant 3
+  coarbitrary (VarArg p b)   = variant 3 . coarbitrary (p, b)
   coarbitrary MetaArg        = variant 4
   coarbitrary (ConArgType a) = variant 5 . coarbitrary a
   coarbitrary (IndArgType a) = variant 6 . coarbitrary a
@@ -55,7 +56,7 @@ instance CoArbitrary Where where
                              = variant 11 . coarbitrary a
   coarbitrary (InClause a)   = variant 7 . coarbitrary a
   coarbitrary Matched        = variant 8
-  coarbitrary IsIndex        = variant 9
+  coarbitrary InIndex        = variant 9
   coarbitrary (InDefOf a)    = variant 10 . coarbitrary a
 
 instance Arbitrary Occurrence where
@@ -100,6 +101,9 @@ prop_Occurrence_ostar x =
     &&
   ostar x == oplus oone (otimes (ostar x) x)
 
+prop_Occurrence_mixed_absorptive :: Occurrence -> Bool
+prop_Occurrence_mixed_absorptive = isZero Mixed oplus
+
 -- | Is the given predicate satisfiable?
 
 satisfiable :: (Occurrence -> Bool) -> Bool
@@ -139,32 +143,36 @@ prop_boundToEverySome1 (NonEmpty w) =
 prop_boundToEverySome2 :: Property
 prop_boundToEverySome2 =
   forAll (elements $ Map.toList boundToEverySome) $ \(bound, ess) ->
-    (forAll (oneof [ do os1 <- listOf (arbitrary `suchThat` every)
-                        o   <- arbitrary
-                                 `suchThat` (\o -> every o && some o)
+    let left =
+          forAll
+            (oneof [ do os1 <- listOf (arbitrary `suchThat` every)
+                        o   <- arbitrary `suchThat` (\o -> every o && some o)
                         os2 <- listOf (arbitrary `suchThat` every)
                         return (os1 ++ [o] ++ os2)
                    | (every, some) <- ess
-                   ]) $ \w ->
-       foldr1 otimes w <= bound)
-      .&&.
-    (forAll (do
-         ess <- mapM (\(e, s) ->
-                         elements
-                           (Left e :
-                            [ Right s | satisfiable (not . s) ])) ess
-         let (es, ss) = partitionEithers ess
-             every    = \o -> and [ not (s o) | s <- ss ]
-             some e   = \o -> every o && not (e o)
-             everyG   = arbitrary `suchThat` every
-             segment  = listOf everyG
-         os <- uniqOn id <$> mapM (\e -> arbitrary `suchThat` some e) es
-         if Prelude.null os
-           then listOf1 everyG
-           else (++) <$> listOf everyG
-                     <*> (concat <$>
-                            mapM (\o -> (o :) <$> listOf everyG) os))
-       (\w -> not (foldr1 otimes w <= bound)))
+                   ])
+            (\w -> foldr1 otimes w <= bound)
+
+        right =
+           forAll
+            (do
+              ess <- mapM
+                (\(e, s) -> elements (Left e : [ Right s | satisfiable (not . s) ]))
+                ess
+
+              let (es, ss) = partitionEithers ess
+                  every    = \o -> and [ not (s o) | s <- ss ]
+                  some e   = \o -> every o && not (e o)
+                  everyG   = arbitrary `suchThat` every
+                  segment  = listOf everyG
+              os <- uniqOn id <$> mapM (\e -> arbitrary `suchThat` some e) es
+              if Prelude.null os
+                then listOf1 everyG
+                else (++) <$> listOf everyG
+                          <*> (concat <$> mapM (\o -> (o :) <$> listOf everyG) os))
+            (\w -> not (foldr1 otimes w <= bound))
+
+    in left .&&. right
 
 ------------------------------------------------------------------------
 -- * All tests

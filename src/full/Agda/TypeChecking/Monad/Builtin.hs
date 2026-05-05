@@ -4,16 +4,13 @@ module Agda.TypeChecking.Monad.Builtin
   , module Agda.Syntax.Builtin  -- The names are defined here.
   ) where
 
-import qualified Control.Monad.Fail as Fail
-
-import Control.Monad                ( liftM2, void )
-import Control.Monad.Except
+import Control.Monad.Except         ( MonadError(..), ExceptT )
 import Control.Monad.IO.Class       ( MonadIO(..) )
-import Control.Monad.Reader
-import Control.Monad.State
-import Control.Monad.Trans.Identity (IdentityT)
+import Control.Monad.Reader         ( ReaderT )
+import Control.Monad.State          ( StateT )
+import Control.Monad.Trans.Identity ( IdentityT )
 import Control.Monad.Trans.Maybe
-import Control.Monad.Writer
+import Control.Monad.Writer         ( WriterT )
 
 import Data.Function ( on )
 import qualified Data.Map as Map
@@ -37,11 +34,15 @@ import Agda.Utils.Singleton
 import Agda.Utils.Tuple
 import Agda.Utils.Update
 
+import Agda.Utils.StrictReader qualified as Strict
+import Agda.Utils.StrictWriter qualified as Strict
+import Agda.Utils.StrictState  qualified as Strict
+
 import Agda.Utils.Impossible
 
 class ( Functor m
       , Applicative m
-      , Fail.MonadFail m
+      , Monad m
       ) => HasBuiltins m where
   getBuiltinThing :: SomeBuiltin -> m (Maybe (Builtin PrimFun))
 
@@ -56,6 +57,9 @@ instance HasBuiltins m => HasBuiltins (MaybeT m)
 instance HasBuiltins m => HasBuiltins (ReaderT e m)
 instance HasBuiltins m => HasBuiltins (StateT s m)
 instance (HasBuiltins m, Monoid w) => HasBuiltins (WriterT w m)
+instance HasBuiltins m => HasBuiltins (Strict.ReaderT e m)
+instance HasBuiltins m => HasBuiltins (Strict.StateT s m)
+instance (HasBuiltins m, Monoid w) => HasBuiltins (Strict.WriterT w m)
 
 deriving instance HasBuiltins m => HasBuiltins (BlockT m)
 
@@ -64,6 +68,7 @@ instance MonadIO m => HasBuiltins (TCMT m) where
     liftM2 (unionMaybeWith unionBuiltin)
       (Map.lookup b <$> useTC stLocalBuiltins)
       (Map.lookup b <$> useTC stImportedBuiltins)
+{-# SPECIALIZE getBuiltinThing :: SomeBuiltin -> TCM (Maybe (Builtin PrimFun)) #-}
 
 
 -- | The trivial implementation of 'HasBuiltins', using a constant 'TCState'.
@@ -73,7 +78,7 @@ instance MonadIO m => HasBuiltins (TCMT m) where
 newtype BuiltinAccess a = BuiltinAccess { unBuiltinAccess :: TCState -> a }
   deriving (Functor, Applicative, Monad)
 
-instance Fail.MonadFail BuiltinAccess where
+instance MonadFail BuiltinAccess where
   fail msg = BuiltinAccess $ \_ -> error msg
 
 instance HasBuiltins BuiltinAccess where
@@ -108,7 +113,7 @@ litType = \case
   where
     el t = El (mkType 0) t
 
-setBuiltinThings :: BuiltinThings PrimFun -> TCM ()
+setBuiltinThings :: BuiltinThings -> TCM ()
 setBuiltinThings b = stLocalBuiltins `setTCLens` b
 
 bindBuiltinName :: BuiltinId -> Term -> TCM ()
@@ -138,32 +143,61 @@ bindBuiltinRewriteRelation x =
     Map.insertWith unionBuiltin (BuiltinName builtinRewrite) (BuiltinRewriteRelations $ singleton x)
 
 -- | Get the currently registered rewrite relation symbols.
-getBuiltinRewriteRelations :: HasBuiltins m => m (Maybe (Set QName))
-getBuiltinRewriteRelations = fmap rels <$> getBuiltinThing (BuiltinName builtinRewrite)
+getBuiltinRewriteRelations :: (HasBuiltins m, MonadTCError m) => m (Set QName)
+getBuiltinRewriteRelations =
+  fromMaybeM (typeError $ NoBindingForBuiltin builtinRewrite) getBuiltinRewriteRelations'
+
+-- | Get the currently registered rewrite relation symbols, if any.
+getBuiltinRewriteRelations' :: HasBuiltins m => m (Maybe (Set QName))
+getBuiltinRewriteRelations' = fmap rels <$> getBuiltinThing (BuiltinName builtinRewrite)
   where
   rels = \case
     BuiltinRewriteRelations xs -> xs
     Prim{}    -> __IMPOSSIBLE__
     Builtin{} -> __IMPOSSIBLE__
 
+{-# INLINABLE getBuiltinName_ #-}
+getBuiltinName_ :: (HasBuiltins m, MonadTCError m)
+  => BuiltinId -> m QName
+getBuiltinName_ x =
+  fromMaybeM (typeError $ NoBindingForBuiltin x) $ getBuiltinName' x
+
+-- {-# INLINABLE getBuiltinName' #-}
+-- -- | Returns 'Nothing' if built-in is not bound or bound to a 'Prim' or anything other than a 'Def'.
+-- getBuiltinName' :: HasBuiltins m => BuiltinId -> m (Maybe Term)
+-- getBuiltinName' x = (getBuiltinName =<<) <$> getBuiltin' x
+--   where
+--     getBuiltinName = \case
+--       Def f [] -> Just f
+--       _        -> Nothing
+
+{-# SPECIALIZE getBuiltin :: BuiltinId -> TCM Term #-}
 getBuiltin :: (HasBuiltins m, MonadTCError m)
            => BuiltinId -> m Term
 getBuiltin x =
   fromMaybeM (typeError $ NoBindingForBuiltin x) $ getBuiltin' x
 
+{-# SPECIALIZE getBuiltin' :: BuiltinId -> TCM (Maybe Term) #-}
+-- | Returns 'Nothing' if built-in is not bound or bound to a 'Prim'.
 getBuiltin' :: HasBuiltins m => BuiltinId -> m (Maybe Term)
-getBuiltin' x = (getBuiltin =<<) <$> getBuiltinThing (BuiltinName x) where
-  getBuiltin BuiltinRewriteRelations{} = __IMPOSSIBLE__
-  getBuiltin (Builtin t)               = Just $ killRange t
-  getBuiltin _                         = Nothing
+getBuiltin' x = (getBuiltin =<<) <$> getBuiltinThing (BuiltinName x)
+  where
+    getBuiltin = \case
+      Builtin t                 -> Just $ killRange t
+      Prim{}                    -> Nothing
+      BuiltinRewriteRelations{} -> __IMPOSSIBLE__
 
+{-# SPECIALIZE getPrimitive' :: PrimitiveId -> TCM (Maybe PrimFun)  #-}
+-- | Returns 'Nothing' if primitive is not bound or bound to a 'Builtin'.
 getPrimitive' :: HasBuiltins m => PrimitiveId -> m (Maybe PrimFun)
 getPrimitive' x = (getPrim =<<) <$> getBuiltinThing (PrimitiveName x)
   where
-    getPrim (Prim pf) = return pf
-    getPrim BuiltinRewriteRelations{} = __IMPOSSIBLE__
-    getPrim _         = Nothing
+    getPrim = \case
+      Prim pf                   -> return pf
+      Builtin{}                 -> Nothing
+      BuiltinRewriteRelations{} -> __IMPOSSIBLE__
 
+{-# INLINABLE getPrimitive #-}
 getPrimitive :: (HasBuiltins m, MonadError TCErr m, MonadTCEnv m, ReadTCState m)
              => PrimitiveId -> m PrimFun
 getPrimitive x =
@@ -172,6 +206,7 @@ getPrimitive x =
 getPrimitiveTerm :: (HasBuiltins m, MonadError TCErr m, MonadTCEnv m, ReadTCState m)
                  => PrimitiveId -> m Term
 getPrimitiveTerm x = (`Def` []) . primFunName <$> getPrimitive x
+
 
 getPrimitiveTerm' :: HasBuiltins m => PrimitiveId -> m (Maybe Term)
 getPrimitiveTerm' x = fmap (`Def` []) <$> getPrimitiveName' x
@@ -200,8 +235,19 @@ constructorForm :: HasBuiltins m => Term -> m Term
 constructorForm v = do
   let pZero = fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinZero
       pSuc  = fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinSuc
+  -- By passing the builtins lazily we do not have to look them up if @v@ is not a 'LitNat'.
   constructorForm' pZero pSuc v
 
+-- | Produce a function that rewrites a literal to constructor form if possible.
+constructorFormer :: HasBuiltins m => m (Term -> Term)
+constructorFormer = do
+  mz <- getBuiltin' builtinZero
+  ms <- getBuiltin' builtinSuc
+  return \ v -> fromMaybe v (constructorForm' mz ms v)
+
+{-# INLINABLE constructorForm' #-}
+{-# SPECIALIZE constructorForm' :: TCM Term -> TCM Term -> Term -> TCM Term #-}
+{-# SPECIALIZE constructorForm' :: Maybe Term -> Maybe Term -> Term -> Maybe Term #-}
 constructorForm' :: Applicative m => m Term -> m Term -> Term -> m Term
 constructorForm' pZero pSuc v =
   case v of
@@ -224,7 +270,6 @@ primInteger, primIntegerPos, primIntegerNegSuc,
     primIsOne, primItIsOne, primIsOne1, primIsOne2, primIsOneEmpty,
     primSub, primSubIn, primSubOut,
     primTrans, primHComp,
-    primId, primConId, primIdElim,
     primEquiv, primEquivFun, primEquivProof,
     primTranspProof,
     primGlue, prim_glue, prim_unglue,
@@ -278,9 +323,12 @@ primInteger, primIntegerPos, primIntegerNegSuc,
     primAgdaTCMAskNormalisation, primAgdaTCMAskReconstructed,
     primAgdaTCMAskExpandLast, primAgdaTCMAskReduceDefs,
     primAgdaTCMNoConstraints,
+    primAgdaTCMWorkOnTypes,
     primAgdaTCMRunSpeculative,
     primAgdaTCMExec,
+    primAgdaTCMCheckFromString,
     primAgdaTCMGetInstances,
+    primAgdaTCMSolveInstances,
     primAgdaTCMPragmaForeign,
     primAgdaTCMPragmaCompile
     :: (HasBuiltins m, MonadError TCErr m, MonadTCEnv m, ReadTCState m) => m Term
@@ -304,9 +352,6 @@ primMaybe                             = getBuiltin builtinMaybe
 primNothing                           = getBuiltin builtinNothing
 primJust                              = getBuiltin builtinJust
 primIO                                = getBuiltin builtinIO
-primId                                = getBuiltin builtinId
-primConId                             = getPrimitiveTerm builtinConId
-primIdElim                            = getPrimitiveTerm builtinIdElim
 primPath                              = getBuiltin builtinPath
 primPathP                             = getBuiltin builtinPathP
 primIntervalUniv                      = getBuiltin builtinIntervalUniv
@@ -494,9 +539,12 @@ primAgdaTCMAskReduceDefs              = getBuiltin builtinAgdaTCMAskReduceDefs
 primAgdaTCMFormatErrorParts           = getBuiltin builtinAgdaTCMFormatErrorParts
 primAgdaTCMDebugPrint                 = getBuiltin builtinAgdaTCMDebugPrint
 primAgdaTCMNoConstraints              = getBuiltin builtinAgdaTCMNoConstraints
+primAgdaTCMWorkOnTypes                = getBuiltin builtinAgdaTCMWorkOnTypes
 primAgdaTCMRunSpeculative             = getBuiltin builtinAgdaTCMRunSpeculative
 primAgdaTCMExec                       = getBuiltin builtinAgdaTCMExec
+primAgdaTCMCheckFromString            = getBuiltin builtinAgdaTCMCheckFromString
 primAgdaTCMGetInstances               = getBuiltin builtinAgdaTCMGetInstances
+primAgdaTCMSolveInstances             = getBuiltin builtinAgdaTCMSolveInstances
 primAgdaTCMPragmaForeign              = getBuiltin builtinAgdaTCMPragmaForeign
 primAgdaTCMPragmaCompile              = getBuiltin builtinAgdaTCMPragmaCompile
 
@@ -512,9 +560,9 @@ data CoinductionKit = CoinductionKit
 
 coinductionKit' :: TCM CoinductionKit
 coinductionKit' = do
-  Def inf   _ <- primInf
-  Def sharp _ <- primSharp
-  Def flat  _ <- primFlat
+  inf   <- getBuiltinName_ builtinInf
+  sharp <- getBuiltinName_ builtinSharp
+  flat  <- getBuiltinName_ builtinFlat
   return $ CoinductionKit
     { nameOfInf   = inf
     , nameOfSharp = sharp
@@ -555,14 +603,14 @@ mkSortKit prop set sset propomega setomega ssetomega = SortKit
 -- When 'optLoadPrimitives' is set to 'False', 'sortKit' is a fallible operation,
 -- so for the uses of 'sortKit' in fallible contexts (e.g. 'TCM'),
 -- we report a type error rather than exploding.
-sortKit :: (HasBuiltins m, MonadTCError m, HasOptions m) => m SortKit
+sortKit :: (HasBuiltins m, MonadTCError m) => m SortKit
 sortKit = do
-  Def prop     _  <- getBuiltin builtinProp
-  Def set      _  <- getBuiltin builtinSet
-  Def sset     _  <- getBuiltin builtinStrictSet
-  Def propomega _ <- getBuiltin builtinPropOmega
-  Def setomega _  <- getBuiltin builtinSetOmega
-  Def ssetomega _ <- getBuiltin builtinSSetOmega
+  prop      <- getBuiltinName_ builtinProp
+  set       <- getBuiltinName_ builtinSet
+  sset      <- getBuiltinName_ builtinStrictSet
+  propomega <- getBuiltinName_ builtinPropOmega
+  setomega  <- getBuiltinName_ builtinSetOmega
+  ssetomega <- getBuiltinName_ builtinSSetOmega
   return $ mkSortKit prop set sset propomega setomega ssetomega
 
 -- | Compute a 'SortKit' in contexts that do not support failure (e.g.
@@ -571,12 +619,12 @@ sortKit = do
 -- checking.
 infallibleSortKit :: HasBuiltins m => m SortKit
 infallibleSortKit = do
-  Def prop     _  <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinProp
-  Def set      _  <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinSet
-  Def sset     _  <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinStrictSet
-  Def propomega _ <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinPropOmega
-  Def setomega _  <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinSetOmega
-  Def ssetomega _ <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinSSetOmega
+  prop      <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinProp
+  set       <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinSet
+  sset      <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinStrictSet
+  propomega <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinPropOmega
+  setomega  <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinSetOmega
+  ssetomega <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinSSetOmega
   return $ mkSortKit prop set sset propomega setomega ssetomega
 
 ------------------------------------------------------------------------
@@ -585,7 +633,7 @@ infallibleSortKit = do
 
 getPrimName :: Term -> QName
 getPrimName ty = do
-  let lamV (Lam i b)  = mapFst (getHiding i :) $ lamV (unAbs b)
+  let lamV (Lam i b)  = first (getHiding i :) $ lamV (unAbs b)
       lamV (Pi _ b)   = lamV (unEl $ unAbs b)
       lamV v          = ([], v)
   case lamV ty of
@@ -606,6 +654,8 @@ isPrimitive n q = (Just q ==) <$> getPrimitiveName' n
 intervalSort :: Sort
 intervalSort = IntervalUniv
 
+{-# SPECIALIZE intervalView' :: TCM (Term -> IntervalView) #-}
+{-# INLINABLE intervalView' #-}
 intervalView' :: HasBuiltins m => m (Term -> IntervalView)
 intervalView' = do
   iz <- getBuiltinName' builtinIZero
@@ -625,6 +675,7 @@ intervalView' = do
                  | Just (conName q) == io -> IOne
       _ -> OTerm t
 
+{-# INLINE intervalView #-}
 intervalView :: HasBuiltins m => Term -> m IntervalView
 intervalView t = do
   f <- intervalView'
@@ -635,6 +686,7 @@ intervalUnview t = do
   f <- intervalUnview'
   return (f t)
 
+{-# SPECIALIZE intervalUnview' :: TCM (IntervalView -> Term) #-}
 intervalUnview' :: HasBuiltins m => m (IntervalView -> Term)
 intervalUnview' = do
   iz <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinIZero -- should it be a type error instead?
@@ -659,11 +711,13 @@ intervalUnview' = do
 --
 --   Precondition: type is reduced.
 
+{-# INLINE pathView #-}
 pathView :: HasBuiltins m => Type -> m PathView
 pathView t0 = do
   view <- pathView'
   return $ view t0
 
+{-# SPECIALIZE pathView' :: TCM (Type -> PathView)  #-}
 pathView' :: HasBuiltins m => m (Type -> PathView)
 pathView' = do
  mpath  <- getBuiltinName' builtinPath
@@ -676,18 +730,6 @@ pathView' = do
     Def path' [ Apply level , Apply typ , Apply lhs , Apply rhs ]
       | Just path' == mpathp, Just path <- mpathp -> PathType s path level typ lhs rhs
     _ -> OType t0
-
--- | Non dependent Path
-idViewAsPath :: HasBuiltins m => Type -> m PathView
-idViewAsPath t0@(El s t) = do
-  mid <- fmap getPrimName <$> getBuiltin' builtinId
-  mpath <- fmap getPrimName <$> getBuiltin' builtinPath
-  case mid of
-   Just path | isJust mpath -> case t of
-    Def path' [ Apply level , Apply typ , Apply lhs , Apply rhs ]
-      | path' == path -> return $ PathType s (fromJust mpath) level typ lhs rhs
-    _ -> return $ OType t0
-   _ -> return $ OType t0
 
 boldPathView :: Type -> PathView
 boldPathView t0@(El s t) = do
@@ -706,29 +748,11 @@ pathUnview (PathType s path l t lhs rhs) =
   El s $ Def path $ map Apply [l, t, lhs, rhs]
 
 ------------------------------------------------------------------------
--- * Swan's Id Equality
-------------------------------------------------------------------------
-
--- f x (< phi , p > : Id A x _) = Just (phi,p)
-conidView' :: HasBuiltins m => m (Term -> Term -> Maybe (Arg Term,Arg Term))
-conidView' = do
-  mn <- sequence <$> mapM getName' [someBuiltin builtinReflId, someBuiltin builtinConId]
-  mio <- getTerm' builtinIOne
-  let fallback = return $ \ _ _ -> Nothing
-  caseMaybe mn fallback $ \ [refl,conid] ->
-   caseMaybe mio fallback $ \ io -> return $ \ x t ->
-    case t of
-      Con h _ [] | conName h == refl -> Just (defaultArg io,defaultArg (Lam defaultArgInfo $ NoAbs "_" $ x))
-      Def d es | Just [l,a,x,y,phi,p] <- allApplyElims es, d == conid -> Just (phi, p)
-      _ -> Nothing
-
-------------------------------------------------------------------------
 -- * Builtin equality
 ------------------------------------------------------------------------
 
 -- | Get the name of the equality type.
 primEqualityName :: TCM QName
--- primEqualityName = getDef =<< primEquality  -- LEADS TO IMPORT CYCLE
 primEqualityName = do
   eq <- primEquality
   -- Andreas, 2014-05-17 moved this here from TC.Rules.Def
@@ -739,7 +763,7 @@ primEqualityName = do
   -- 1. universe and type polymorphic
   -- 2. type polymorphic only
   -- 3. monomorphic.
-  let lamV (Lam i b)  = mapFst (getHiding i :) $ lamV (unAbs b)
+  let lamV (Lam i b)  = first (getHiding i :) $ lamV (unAbs b)
       lamV v          = ([], v)
   return $ case lamV eq of
     (_, Def equality _) -> equality
@@ -750,8 +774,11 @@ primEqualityName = do
 --
 --   Precondition: type is reduced.
 
-equalityView :: Type -> TCM EqualityView
-equalityView t0@(El s t) = do
+equalityView ::
+     Range  -- ^ Range of the @rewrite@ expression, if any.
+  -> Type   -- ^ Identity type?
+  -> TCM EqualityView
+equalityView r t0@(El s t) = do
   equality <- primEqualityName
   case t of
     Def equality' es | equality' == equality -> do
@@ -759,7 +786,7 @@ equalityView t0@(El s t) = do
       let n = length vs
       unless (n >= 3) __IMPOSSIBLE__
       let (pars, [ typ , lhs, rhs ]) = splitAt (n-3) vs
-      return $ EqualityType s equality pars typ lhs rhs
+      return $ EqualityType r s equality pars typ lhs rhs
     _ -> return $ OtherType t0
 
 -- | Revert the 'EqualityView'.
@@ -776,14 +803,13 @@ instance EqualityUnview EqualityView where
     EqualityViewType eqt -> equalityUnview eqt
 
 instance EqualityUnview EqualityTypeData where
-  equalityUnview (EqualityTypeData s equality l t lhs rhs) =
+  equalityUnview (EqualityTypeData _r s equality l t lhs rhs) =
     El s $ Def equality $ map Apply (l ++ [t, lhs, rhs])
 
 -- | Primitives with typechecking constrants.
 constrainedPrims :: [PrimitiveId]
 constrainedPrims =
-  [ builtinConId
-  , builtinPOr
+  [ builtinPOr
   , builtinComp
   , builtinHComp
   , builtinTrans

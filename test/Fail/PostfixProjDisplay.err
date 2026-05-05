@@ -1,0 +1,7 @@
+PostfixProjDisplay.agda:25.8-12: error: [UnequalTerms]
+The terms
+  a + a
+and
+  a
+are not equal at type A
+when checking that the expression refl has type (a + a) ≡ a

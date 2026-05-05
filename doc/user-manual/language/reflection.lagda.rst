@@ -1,5 +1,7 @@
 ..
   ::
+  {-# OPTIONS --allow-unsolved-metas #-}
+
   module language.reflection where
 
   open import Agda.Builtin.Sigma
@@ -325,7 +327,8 @@ below <reflection-tc-monad>`.
     data-type   : (pars : Nat) (cs : List Name) → Definition  -- parameters and constructors
     record-type : (c : Name) (fs : List (Arg Name)) →         -- c: name of record constructor
                   Definition                                  -- fs: fields
-    data-cons   : (d : Name) → Definition                     -- d: name of data type
+    data-cons   : (d : Name) (q : Quantity) → Definition      -- d: name of data type
+                                                              -- q: constructor quantity
     axiom       : Definition
     prim-fun    : Definition
 
@@ -477,9 +480,9 @@ following primitive operations::
     declareData      : Name → Nat → Type → TC ⊤
 
     -- Define a declared datatype. The datatype must have been declared using
-    -- 'declareData`. The second argument is a list of pairs in which each pair
-    -- is the name of a constructor and its type.
-    defineData       : Name → List (Σ Name (λ _ → Type)) → TC ⊤
+    -- 'declareData`. The second argument is a list of triples in which each triple
+    -- is the name of a constructor, its erasure status and its type.
+    defineData       : Name → List (Σ Name (λ _ → Σ Quantity (λ _ → Type))) → TC ⊤
 
     -- Define a declared function. The function may have been declared using
     -- 'declareDef' or with an explicit type signature in the program.
@@ -522,6 +525,10 @@ following primitive operations::
     withReduceDefs : ∀ {a} {A : Set a} → (Σ Bool λ _ → List Name) → TC A → TC A
     askReduceDefs  : TC (Σ Bool λ _ → List Name)
 
+    -- Parse and type check the given string against the given type, returning
+    -- the resulting term (when successful).
+    checkFromStringTC : String → Type → TC Term
+
     -- Prints the third argument to the debug buffer in Emacs
     -- if the verbosity level (set by the -v flag to Agda)
     -- is higher than the second argument. Note that Level 0 and 1 are printed
@@ -536,6 +543,9 @@ following primitive operations::
     -- "blocking" constraints.
     noConstraints : ∀ {a} {A : Set a} → TC A → TC A
 
+    -- Run the given computation at the type level, allowing use of erased things.
+    workOnTypes : ∀ {a} {A : Set a} → TC A → TC A
+
     -- Run the given TC action and return the first component. Resets to
     -- the old TC state if the second component is 'false', or keep the
     -- new TC state if it is 'true'.
@@ -544,6 +554,12 @@ following primitive operations::
     -- Get a list of all possible instance candidates for the given meta
     -- variable (it does not have to be an instance meta).
     getInstances : Meta → TC (List Term)
+
+    -- Try to solve open instance constraints. When wrapped in `noConstraints`,
+    -- fails if there are unsolved instance constraints left over that originate
+    -- from the current macro invokation. Outside constraints are still attempted,
+    -- but failure to solve them are ignored by `noConstraints`.
+    solveInstanceConstraints : TC ⊤
 
   {-# BUILTIN AGDATCMUNIFY                      unify                      #-}
   {-# BUILTIN AGDATCMTYPEERROR                  typeError                  #-}
@@ -569,6 +585,8 @@ following primitive operations::
   {-# BUILTIN AGDATCMGETDEFINITION              getDefinition              #-}
   {-# BUILTIN AGDATCMCOMMIT                     commitTC                   #-}
   {-# BUILTIN AGDATCMISMACRO                    isMacro                    #-}
+  {-# BUILTIN AGDATCMPRAGMAFOREIGN              pragmaForeign              #-}
+  {-# BUILTIN AGDATCMPRAGMACOMPILE              pragmaCompile              #-}
   {-# BUILTIN AGDATCMWITHNORMALISATION          withNormalisation          #-}
   {-# BUILTIN AGDATCMWITHRECONSTRUCTED          withReconstructed          #-}
   {-# BUILTIN AGDATCMWITHEXPANDLAST             withExpandLast             #-}
@@ -579,8 +597,10 @@ following primitive operations::
   {-# BUILTIN AGDATCMASKREDUCEDEFS              askReduceDefs              #-}
   {-# BUILTIN AGDATCMDEBUGPRINT                 debugPrint                 #-}
   {-# BUILTIN AGDATCMNOCONSTRAINTS              noConstraints              #-}
+  {-# BUILTIN AGDATCMWORKONTYPES                workOnTypes                #-}
   {-# BUILTIN AGDATCMRUNSPECULATIVE             runSpeculative             #-}
   {-# BUILTIN AGDATCMGETINSTANCES               getInstances               #-}
+  {-# BUILTIN AGDATCMSOLVEINSTANCES             solveInstanceConstraints   #-}
 
 Metaprogramming
 ---------------
@@ -636,6 +656,10 @@ Limitations:
   - Macros cannot be recursive. This can be worked around by defining the
     recursive function outside the macro block and have the macro call the
     recursive function.
+
+  - Macros and ``quoteTerm`` can get blocked on quoting a term with an
+    interactive hole inside it. Enable :option:`--quote-metas` to disable this
+    blocking, so that quoted holes can be constrained by macro unquoting.
 
 Silly example:
 
@@ -822,6 +846,14 @@ Another form of ``unquoteDecl`` is used to declare data types:
 ``m`` is a metaprogram required to declare and define a data type ``x`` and
 its constructors ``c₁`` to ``cₙ`` using ``declareData`` and ``defineData``.
 
+.. note::
+   To debug code generated by ``unquoteDecl`` and ``unquoteDef`` it can be useful to
+   turn on the verbosity flags ``-v tc.unquote.decl:10`` (for type signatures) and
+   ``-v tc.unquote.def:10`` (for definition bodies). This will cause the generated code
+   to be printed on stdout when running from the command line or in the debug buffer
+   when loading from an editor.
+   Unlike other verbosity flags, these two are available even if Agda has been built with the ``debug`` Cabal flag.
+
 System Calls
 ~~~~~~~~~~~~
 
@@ -870,3 +902,59 @@ For instance, to run the example above, you must add ``/bin/echo`` to this file:
 
 The executable can then be called by passing its basename to ``execTC``,
 subtracting the ``.exe`` on Windows.
+
+.. _quote-metas:
+
+Quote Metas
+~~~~~~~~~~~
+
+The option :option:`--quote-metas` enables term quotation constraints to be
+resolved even when the term has meta variables in it. This allows for typed
+hole-driven development for macros, where the expected type for an interactive
+hole given as a quoted argument to a macro can be constrained by the unquoting
+of the macro.
+
+In the following example without, :option:`--quote-metas` , the interactive hole
+will cause the constraint to be blocked, which looks something like
+``quoteTerm ?0 : Term (blocked on _17)``.
+
+::
+    open import Agda.Builtin.Unit
+    open import Agda.Builtin.Nat
+    open import Agda.Builtin.List
+
+    repeat-helper : Nat → Name → Term → Term
+    repeat-helper zero f a = a
+    repeat-helper (suc n) f a = con f ((arg (arg-info visible (modality relevant quantity-ω)) (repeat-helper n f a)) ∷ [])
+
+    macro
+      repeat : Nat → Name → Term → Term → TC ⊤
+      repeat n f a hole = unify hole (repeat-helper n f a)
+
+    _ : Nat
+    _ = repeat 10 suc {! !}
+
+
+However, actually unquoting the macro would reveal that the interactive hole
+should have type ``ℕ``. Enabling :option:`--quote-metas` allows exactly this.
+
+.. code-block:: agda
+
+    {-# OPTIONS --quote-metas #-}
+
+    -- ...
+
+    ex1 = repeat 10 f {! !}
+
+Now, the macro will be unquoted, which in this spliced code applies ``f`` to the
+hole's value. This constrains hole's type to be ``ℕ``, and the user can inspect
+the expected context and type of the hole to learn this.
+
+.. note::
+
+    In this example, the hole's type is not constrained by the spliced code, so
+    it will have an unknown inferred type.
+
+    .. code-block:: agda
+
+        ex2 = repeat 0 f {! !}

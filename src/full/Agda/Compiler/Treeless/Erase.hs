@@ -8,13 +8,13 @@ module Agda.Compiler.Treeless.Erase
        , isErasable
        ) where
 
-import Control.Arrow (first, second)
-import Control.Monad
-import Control.Monad.State
+import Control.Monad.State ( StateT, evalStateT )
+
 import Data.Map (Map)
 import qualified Data.Map as Map
 
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Syntax.Internal as I
 import Agda.Syntax.Treeless
 import Agda.Syntax.Literal
@@ -26,18 +26,16 @@ import Agda.TypeChecking.Datatypes
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Primitive
 
-import {-# SOURCE #-} Agda.Compiler.Backend
 import Agda.Compiler.Treeless.Subst
 import Agda.Compiler.Treeless.Unused
 
 import Agda.Utils.Functor
-import Agda.Utils.Lens
+import Agda.Utils.IntSet.Infinite ( IntSet )
+import Agda.Utils.IntSet.Infinite qualified as IntSet
 import Agda.Utils.Maybe
 import Agda.Utils.Memo
 import Agda.Utils.Monad
-import Agda.Syntax.Common.Pretty (prettyShow)
-import Agda.Utils.IntSet.Infinite (IntSet)
-import qualified Agda.Utils.IntSet.Infinite as IntSet
+import Agda.Utils.Tuple           ( first, second )
 
 import Agda.Utils.Impossible
 
@@ -305,11 +303,6 @@ getFunInfo q = memo (funMap . key q) $ getInfo q
 
 isErasable :: QName -> TCM Bool
 isErasable qn =
-  -- The active backend should be set
-  caseMaybeM (viewTC eActiveBackendName) __IMPOSSIBLE__ $ \ bname ->
-  -- However it may not be part of the set of available backends
-  -- in which case we default to not erasable to avoid false negatives.
-  caseMaybeM (lookupBackend bname)       (pure False)   $ \ _ ->
   erasable . snd <$> runE (getFunInfo qn)
 
 telListView :: Type -> TCM (ListTel, Type)
@@ -350,7 +343,6 @@ getTypeInfo t0 = do
   typeInfo :: QName -> E TypeInfo
   typeInfo q = ifM (erasureForbidden q) (return NotErasable) $ {-else-} do
     memoRec (typeMap . key q) Erasable $ do  -- assume recursive occurrences are erasable
-      mId    <- lift $ getName' builtinId
       msizes <- lift $ mapM getBuiltinName
                          [builtinSize, builtinSizeLt]
       def    <- lift $ getConstInfo q
@@ -359,7 +351,6 @@ getTypeInfo t0 = do
                   I.Record{ recConHead = c }  -> Just [conName c]
                   _                           -> Nothing
       case mcs of
-        _ | Just q == mId        -> return NotErasable
         _ | Just q `elem` msizes -> return Erasable
         Just [c] -> do
           (ts, _) <- lift $ typeWithoutParams c

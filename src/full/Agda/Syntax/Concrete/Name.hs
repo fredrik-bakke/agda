@@ -1,7 +1,13 @@
+{-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
+{-# OPTIONS_GHC -Wunused-binds   #-}
+
 {-| Names in the concrete syntax are just strings (or lists of strings for
     qualified names).
 -}
 module Agda.Syntax.Concrete.Name where
+
+import Prelude hiding (null)
 
 import Control.DeepSeq
 
@@ -23,6 +29,7 @@ import Agda.Utils.Singleton
 import Agda.Utils.Suffix
 
 import Agda.Utils.Impossible
+import Agda.Utils.Null (Null (empty, null))
 
 {-| A name is a non-empty list of alternating 'Id's and 'Hole's. A normal name
     is represented by a singleton list, and operators are represented by a list
@@ -58,6 +65,12 @@ instance Underscore Name where
   isUnderscore NoName{} = True
   isUnderscore (Name {nameNameParts = Id x :| []}) = isUnderscore x
   isUnderscore _ = False
+
+instance Null Name where
+  empty = NoName empty empty
+  null = \case
+    NoName _r i -> null i
+    Name{} -> False
 
 -- | Mixfix identifiers are composed of words and holes,
 --   e.g. @_+_@ or @if_then_else_@ or @[_/_]@.
@@ -114,6 +127,12 @@ instance Underscore QName where
   isUnderscore (QName x) = isUnderscore x
   isUnderscore Qual{}    = False
 
+instance Null QName where
+  empty = QName empty
+  null = \case
+    QName x -> null x
+    Qual{} -> False
+
 ------------------------------------------------------------------------
 -- * Constructing simple 'Name's.
 ------------------------------------------------------------------------
@@ -129,6 +148,12 @@ simpleBinaryOperator s = Name noRange InScope $ Hole :| Id s : Hole : []
 -- | Create an ordinary 'InScope' name containing a single 'Hole'.
 simpleHole :: Name
 simpleHole = Name noRange InScope $ singleton Hole
+
+-- | Check whether a name is a simple identifier without holes.
+isSimpleName :: Name -> Maybe RawName
+isSimpleName = \case
+  Name _ _ (Id x :| []) -> Just x
+  _ -> Nothing
 
 ------------------------------------------------------------------------
 -- * Operations on 'Name' and 'NamePart'

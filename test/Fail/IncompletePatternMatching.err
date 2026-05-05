@@ -1,8 +1,12 @@
-IncompletePatternMatching.agda:14,1-15,15
+IncompletePatternMatching.agda:14.1-15.15: error: [CoverageIssue]
 Incomplete pattern matching for _==_. Missing cases:
   zero == suc x
   suc x == zero
 when checking the definition of _==_
-IncompletePatternMatching.agda:18,7-9
-True !=< zero == suc zero
+
+IncompletePatternMatching.agda:18.7-9: error: [UnequalTypes]
+The type
+  True
+is not a subtype of
+  zero == suc zero
 when checking that the expression tt has type zero == suc zero

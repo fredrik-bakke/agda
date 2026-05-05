@@ -4,30 +4,29 @@ module Agda.TypeChecking.Monad.Signature where
 
 import Prelude hiding (null)
 
-import qualified Control.Monad.Fail as Fail
-
-import Control.Arrow                 ( first, second )
 import Control.Monad.Except          ( ExceptT )
 import Control.Monad.State           ( StateT  )
 import Control.Monad.Reader          ( ReaderT )
 import Control.Monad.Writer          ( WriterT )
-import Control.Monad.Trans.Maybe     ( MaybeT  )
+import Control.Monad.Trans.Maybe     ( MaybeT (MaybeT), runMaybeT  )
 import Control.Monad.Trans.Identity  ( IdentityT )
 import Control.Monad.Trans           ( MonadTrans, lift )
 
-import Data.Foldable (for_)
-import qualified Data.List as List
-import Data.Set (Set)
-import qualified Data.Set as Set
-import qualified Data.Map as Map
-import qualified Data.HashMap.Strict as HMap
+import Data.Either
+import Data.Foldable                 ( for_ )
+import Data.IntMap                   qualified as IntMap
+import Data.List                     qualified as List
+import Data.Set                      ( Set )
+import Data.Set                      qualified as Set
+import Data.Map                      qualified as Map
+import Data.HashMap.Strict           qualified as HMap
 import Data.Maybe
-import Data.Semigroup ((<>))
 
 import Agda.Interaction.Options
 
+import Agda.Syntax.Scope.Base (LiveNames(..), isModuleAlive, isNameAlive)
 import Agda.Syntax.Abstract.Name
-import Agda.Syntax.Abstract (Ren, ScopeCopyInfo(..))
+import Agda.Syntax.Abstract (Ren, renamingSize, ScopeCopyInfo(..))
 import Agda.Syntax.Common
 import Agda.Syntax.Internal as I
 import Agda.Syntax.Internal.Names
@@ -45,29 +44,31 @@ import Agda.TypeChecking.Monad.Open
 import Agda.TypeChecking.Monad.Options
 import Agda.TypeChecking.Monad.State
 import Agda.TypeChecking.Monad.Trace
+import Agda.TypeChecking.Monad.Statistics
 import Agda.TypeChecking.DropArgs
 import Agda.TypeChecking.Warnings
 import Agda.TypeChecking.Positivity.Occurrence
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.CompiledClause
 import Agda.TypeChecking.Coverage.SplitTree
+import {-# SOURCE #-} Agda.TypeChecking.InstanceArguments
 import {-# SOURCE #-} Agda.TypeChecking.CompiledClause.Compile
 import {-# SOURCE #-} Agda.TypeChecking.Polarity
 import {-# SOURCE #-} Agda.TypeChecking.Pretty
 import {-# SOURCE #-} Agda.TypeChecking.ProjectionLike
 import {-# SOURCE #-} Agda.TypeChecking.Reduce
 import {-# SOURCE #-} Agda.TypeChecking.Opacity
+import {-# SOURCE #-} Agda.TypeChecking.Telescope
 
-import {-# SOURCE #-} Agda.Compiler.Treeless.Erase
-import {-# SOURCE #-} Agda.Compiler.Builtin
-
+import qualified Agda.Interaction.Options.ProfileOptions as Profile
 import Agda.Utils.CallStack.Base
 import Agda.Utils.Either
 import Agda.Utils.Function ( applyWhen )
 import Agda.Utils.Functor
 import Agda.Utils.Lens
 import Agda.Utils.List
-import qualified Agda.Utils.List1 as List1
+import Agda.Utils.List1 ( List1, pattern (:|) )
+import Agda.Utils.List1 qualified as List1
 import Agda.Utils.ListT
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
@@ -75,7 +76,11 @@ import Agda.Utils.Null
 import Agda.Syntax.Common.Pretty (Doc, prettyShow)
 import Agda.Utils.Singleton
 import Agda.Utils.Size
+import Agda.Utils.Tuple ( first, second )
 import Agda.Utils.Update
+import Agda.Utils.StrictReader qualified as Strict
+import Agda.Utils.StrictWriter qualified as Strict
+import Agda.Utils.StrictState  qualified as Strict
 
 import Agda.Utils.Impossible
 
@@ -90,7 +95,7 @@ setHardCompileTimeModeIfErased
 setHardCompileTimeModeIfErased erased =
   localTC
     $ applyWhen (isErased erased) (set eHardCompileTimeMode True)
-    . over eQuantity (`composeQuantity` asQuantity erased)
+    . over eQuantityZeroHardCompile (`composeQuantity` asQuantity erased)
 
 -- | If the quantity is \"erased\", then hard compile-time mode is
 -- enabled when the continuation is run.
@@ -117,7 +122,7 @@ setRunTimeModeUnlessInHardCompileTimeMode
   -> TCM a
 setRunTimeModeUnlessInHardCompileTimeMode c =
   ifM (viewTC eHardCompileTimeMode) c $
-  localTC (over eQuantity $ mapQuantity (`addQuantity` topQuantity)) c
+  localTC (over eQuantityZeroHardCompile $ mapQuantity (`addQuantity` topQuantity)) c
 
 -- | Use hard compile-time mode in the continuation if the first
 -- argument is @'Erased' something@. Use run-time mode if the first
@@ -143,8 +148,7 @@ warnForPlentyInHardCompileTimeMode = \case
   Erased{}    -> return ()
   NotErased o -> do
     let warn = warning $ PlentyInHardCompileTimeMode o
-    hard <- viewTC eHardCompileTimeMode
-    if not hard then return () else case o of
+    whenM (viewTC eHardCompileTimeMode) $ case o of
       QωInferred{} -> return ()
       Qω{}         -> warn
       QωPlenty{}   -> warn
@@ -153,6 +157,7 @@ warnForPlentyInHardCompileTimeMode = \case
 addConstant :: QName -> Definition -> TCM ()
 addConstant q d = do
   reportSDoc "tc.signature" 20 $ "adding constant " <+> pretty q <+> " to signature"
+  reportSDoc "tc.signature" 80 $ "definition =" <?> pretty d
 
   -- Every constant that gets added to the signature in hard
   -- compile-time mode is treated as erased.
@@ -165,7 +170,7 @@ addConstant q d = do
         return $ mapQuantity (zeroQuantity `composeQuantity`) d
 
   tel <- getContextTelescope
-  let tel' = replaceEmptyName "r" $ killRange $ case theDef d of
+  let tel' = killRange $ case theDef d of
               Constructor{} -> fmap hideOrKeepInstance tel
               Function{ funProjection = Right Projection{ projProper = Just{}, projIndex = n } } ->
                 let fallback = fmap hideOrKeepInstance tel in
@@ -181,23 +186,33 @@ addConstant q d = do
   i <- currentOrFreshMutualBlock
   setMutualBlock i q
   where
-    new +++ old = new { defDisplay = defDisplay new ++ defDisplay old
-                      , defInstance = defInstance new `mplus` defInstance old }
+    new +++ old = new { defDisplay        = defDisplay new ++ defDisplay old
+                      , defInstance       = defInstance new `mplus` defInstance old
+                      , defArgOccurrences = if null (defArgOccurrences new)
+                                              then defArgOccurrences old
+                                              else defArgOccurrences new
+                      , defPolarity       = if null (defPolarity new)
+                                              then defPolarity old
+                                              else defPolarity new
+                      , defCompiledRep    = Map.unionWith (++)
+                                              (defCompiledRep new)
+                                              (defCompiledRep old)
+                      }
 
 -- | A combination of 'addConstant' and 'defaultDefn'. The 'Language'
 -- does not need to be supplied.
 
 addConstant' ::
-  QName -> ArgInfo -> QName -> Type -> Defn -> TCM ()
-addConstant' q info x t def = do
+  QName -> ArgInfo -> Type -> Defn -> TCM ()
+addConstant' q info t def = do
   lang <- getLanguage
-  addConstant q $ defaultDefn info x t lang def
+  addConstant q $ defaultDefn info q t lang def
 
 -- | Set termination info of a defined function symbol.
-setTerminates :: MonadTCState m => QName -> Bool -> m ()
+setTerminates :: MonadTCState m => QName -> Maybe Bool -> m ()
 setTerminates q b = modifySignature $ updateDefinition q $ updateTheDef $ \case
-    def@Function{} -> def { funTerminates = Just b }
-    def@Record{}   -> def { recTerminates = Just b }
+    def@Function{} -> def { funTerminates = b }
+    def@Record{}   -> def { recTerminates = b }
     def -> def
 
 -- | Set CompiledClauses of a defined function symbol.
@@ -237,25 +252,9 @@ mkPragma s = CompilerPragma <$> getCurrentRange <*> pure s
 
 -- | Add a compiler pragma `{-\# COMPILE <backend> <name> <text> \#-}`
 addPragma :: BackendName -> QName -> String -> TCM ()
-addPragma b q s = ifM erased
-  {- then -} (warning $ PragmaCompileErased b q)
-  {- else -} $ do
+addPragma b q s = do
     pragma <- mkPragma s
     modifySignature $ updateDefinition q $ addCompilerPragma b pragma
-
-  where
-
-  erased :: TCM Bool
-  erased = do
-    def <- theDef <$> getConstInfo q
-    case def of
-      -- If we have a defined symbol, we check whether it is erasable
-      Function{} ->
-        locallyTC      eActiveBackendName (const $ Just b) $
-        locallyTCState stBackends         (const $ builtinBackends) $
-        isErasable q
-     -- Otherwise (Axiom, Datatype, Record type, etc.) we keep it
-      _ -> pure False
 
 getUniqueCompilerPragma :: BackendName -> QName -> TCM (Maybe CompilerPragma)
 getUniqueCompilerPragma backend q = do
@@ -263,11 +262,10 @@ getUniqueCompilerPragma backend q = do
   case ps of
     []  -> return Nothing
     [p] -> return $ Just p
-    (_:p1:_) ->
-      setCurrentRange p1 $
-            genericDocError =<< do
-                  hang (text ("Conflicting " ++ backend ++ " pragmas for") <+> pretty q <+> "at") 2 $
-                       vcat [ "-" <+> pretty (getRange p) | p <- ps ]
+    _:p1:_ -> setCurrentRange p1 do
+      typeError . CustomBackendError backend =<< do
+        hang (hsep [ "Conflicting", pretty backend, "pragmas for", prettyTCM q, "at" ]) 2 $
+          vcat [ "-" <+> pretty (getRange p) | p <- ps ]
 
 setFunctionFlag :: FunctionFlag -> Bool -> QName -> TCM ()
 setFunctionFlag flag val q = modifyGlobalDefinition q $ set (lensTheDef . funFlag flag) val
@@ -281,21 +279,21 @@ markInline b = setFunctionFlag FunInline b
 markInjective :: QName -> TCM ()
 markInjective q = modifyGlobalDefinition q $ \def -> def { defInjective = True }
 
-unionSignatures :: [Signature] -> Signature
-unionSignatures ss = foldr unionSignature emptySignature ss
-  where
-    unionSignature (Sig a b c) (Sig a' b' c') =
-      Sig (Map.union a a')
-          (HMap.union b b')              -- definitions are unique (in at most one module)
-          (HMap.unionWith mappend c c')  -- rewrite rules are accumulated
+markFirstOrder :: QName -> TCM ()
+markFirstOrder = setFunctionFlag FunFirstOrder True
 
 -- | Add a section to the signature.
 --
 --   The current context will be stored as the cumulative module parameters
---   for this section.
+--   for this section, and a module checkpoint entry will be added
+--   into the module checkpoint stack.
 addSection :: ModuleName -> TCM ()
 addSection m = do
   tel <- getContextTelescope
+  addSection' m tel
+
+addSection' :: ModuleName -> Telescope -> TCM ()
+addSection' m tel = do
   let sec = Section tel
   -- Make sure we do not overwrite an existing section!
   whenJustM (getSection m) $ \ sec' -> do
@@ -311,14 +309,9 @@ addSection m = do
       reportSDoc "impossible" 60 $ "with content" <+> pretty sec
       __IMPOSSIBLE__
   -- Add the new section.
-  setModuleCheckpoint m
+  cp <- viewTC eCurrentCheckpoint
+  setModuleCheckpoint m cp
   modifySignature $ over sigSections $ Map.insert m sec
-
--- | Sets the checkpoint for the given module to the current checkpoint.
-setModuleCheckpoint :: ModuleName -> TCM ()
-setModuleCheckpoint m = do
-  chkpt <- viewTC eCurrentCheckpoint
-  stModuleCheckpoints `modifyTCLens` Map.insert m chkpt
 
 -- | Get a section.
 --
@@ -327,7 +320,7 @@ setModuleCheckpoint m = do
 --   A.B.C say, A and A.B do not exist.
 {-# SPECIALIZE getSection :: ModuleName -> TCM (Maybe Section) #-}
 {-# SPECIALIZE getSection :: ModuleName -> ReduceM (Maybe Section) #-}
-getSection :: (Functor m, ReadTCState m) => ModuleName -> m (Maybe Section)
+getSection :: (ReadTCState m) => ModuleName -> m (Maybe Section)
 getSection m = do
   sig  <- (^. stSignature . sigSections) <$> getTCState
   isig <- (^. stImports   . sigSections) <$> getTCState
@@ -339,7 +332,7 @@ getSection m = do
 --   the section telescope is empty.
 {-# SPECIALIZE lookupSection :: ModuleName -> TCM Telescope #-}
 {-# SPECIALIZE lookupSection :: ModuleName -> ReduceM Telescope #-}
-lookupSection :: (Functor m, ReadTCState m) => ModuleName -> m Telescope
+lookupSection :: (ReadTCState m) => ModuleName -> m Telescope
 lookupSection m = maybe EmptyTel (^. secTelescope) <$> getSection m
 
 -- | Add display forms for a name @f@ copied by a module application. Essentially if @f@ can reduce to
@@ -353,6 +346,26 @@ lookupSection m = maybe EmptyTel (^. secTelescope) <$> getSection m
 -- @
 -- A.B.C.f vs ==> f xs
 -- @
+--
+-- Invoking @'addDisplayForms' x@ will add a display form for each copy @x@ transitively reduces to.
+-- E.g. consider the following iterated module application.
+-- @
+--   module M0 (n : Nat) where
+--     b : Bool
+--     b = n > 42
+--   module M1 (n : Nat) = M0 (suc n)
+--   module M2 (n : Nat) = M1 (suc n)
+--   module M3 (n : Nat) = M2 (suc n)
+-- @
+--
+-- For the first copy @M1.b n = M0.b (suc n)@ we add the display form @M0.b (suc n) --> M1.b n@.
+--
+-- For the second copy @M2.b n = M1.b (suc n)@ we first add display form @M1.b (suc n) --> M2.b n@
+-- and for the further unfolding we add display form @M0.b (suc (suc n)) --> M2.b n@.
+--
+-- For the third copy @M3.b n = M2.b (suc n)@ we add display forms @M2.b (suc n) --> M3.b n@,
+-- @M1.b (suc (suc n)) --> M3.b n@ and @M0.b (suc (suc (suc n))) --> M3.b n@.
+
 addDisplayForms :: QName -> TCM ()
 addDisplayForms x = do
   reportSDoc "tc.display.section" 20 $ "Computing display forms for" <+> pretty x
@@ -374,6 +387,8 @@ addDisplayForms x = do
 
   -- and add them
   mapM_ (uncurry addDisplayForm) dfs
+  reportSDoc "tc.display.section" 20 $ "Added display forms for" <+> pretty x
+
   where
 
     -- To get display forms for projections we need to unSpine here.
@@ -437,42 +452,89 @@ applySection
   -> Args           -- ^ Arguments of module application.
   -> ScopeCopyInfo  -- ^ Imported names and modules
   -> TCM ()
-applySection new ptel old ts ScopeCopyInfo{ renModules = rm, renNames = rd } = do
+applySection new ptel old ts info@ScopeCopyInfo{ renModules = rm, renNames = rd } = do
   rd <- closeConstructors rd
-  applySection' new ptel old ts ScopeCopyInfo{ renModules = rm, renNames = rd }
+  applySection' new ptel old ts info{ renModules = rm, renNames = rd }
   where
+
     -- If a datatype is being copied, all its constructors need to be copied,
     -- and if a constructor is copied its datatype needs to be.
+    --
+    -- If a proper projection is being copied, its record needs to be
+    -- copied too (#8037).
     closeConstructors :: Ren QName -> TCM (Ren QName)
     closeConstructors rd = do
-        ds <- nubOn id . catMaybes <$> traverse constructorData (Map.keys rd)
-        cs <- nubOn id . concat    <$> traverse dataConstructors (Map.keys rd)
+        let defs = Map.toList rd
+        ds <- nubOn snd . catMaybes <$> traverse childToParent defs
+        cs <- nubOn snd . concat    <$> traverse parentToChild defs
         new <- Map.unionsWith (<>) <$> traverse rename (ds ++ cs)
         reportSDoc "tc.mod.apply.complete" 30 $
           "also copying: " <+> pretty new
         return $ Map.unionWith (<>) new rd
       where
-        rename :: QName -> TCM (Ren QName)
-        rename x
-          | x `Map.member` rd = pure mempty
+        rename :: (ModuleName, QName) -> TCM (Ren QName)
+        rename (m, x)
+          | x `Map.member` rd          = pure mempty
           | otherwise =
-              Map.singleton x . pure . qnameFromList . singleton <$> freshName_ (prettyShow $ qnameName x)
+            -- Ulf, 2024-06-24 (#7329):
+            --   Here we used to generate an unqualified name, but this breaks things if the new
+            --   module shows up in a module application later on. This is because we use the
+            --   module name to figure out which arguments from the application are relevant for
+            --   the current symbol (see argsToUse in applySection' below).
+            --
+            --   Instead we use the target module name of the thing that required x to be copied.
+            --   For instance, if we are copying a data type A.B.D to X.Y.Z.D and its constructor
+            --   mkD is not in the renaming, we add `A.B.mkD -> X.Y.Z.mkD` (instead of `A.B.mkD ->
+            --   mkD` which we did before).
+            Map.singleton x . pure . qualify m <$> freshName_ (prettyShow $ qnameName x)
 
-        constructorData :: QName -> TCM (Maybe QName)
-        constructorData x = do
-          (theDef <$> getConstInfo x) <&> \case
-            Constructor{ conData = d } -> Just d
-            _                          -> Nothing
+        childToParent :: (QName, List1 QName) -> TCM (Maybe (ModuleName, QName))
+        childToParent (x, y :| _) = do
+          theDef <$> getConstInfo x <&> \case
+            -- the constructors and the data type live in the same
+            -- module, so it suffices to use the same module name that
+            -- the constructor ended up in for the data type
+            Constructor{ conData = d } -> Just (qnameModule y, d)
 
-        dataConstructors :: QName -> TCM [QName]
-        dataConstructors x = do
+            -- If a proper projection is being copied, its record needs to be
+            -- copied too (#8037).
+            --
+            -- #8242: copying a proper projection M.R.proj → N.R.proj does not
+            -- mean we should copy the record type M.R to N.R.R!
+            def | Just Projection{ projProper = Just r } <- isProjection_ def ->
+              let
+                -- putting the record in the parent of where the
+                -- projection ended up seems robust. i don't think it's
+                -- possible for a copied proper projection to end up
+                -- nested relative to the correct place to put the
+                -- record.
+                parent = case initLast (mnameToList (qnameModule y)) of
+                  Just (mod, _) -> mnameFromList mod
+                  Nothing       -> __IMPOSSIBLE__
+              in Just (mnameFromList (init (mnameToList (qnameModule y))), r)
+
+            _ -> Nothing
+
+        parentToChild :: (QName, List1 QName) -> TCM [(ModuleName, QName)]
+        parentToChild (x, y :| _) = do
           (theDef <$> getConstInfo x) <&> \case
-            Datatype{ dataCons = cs } -> cs
-            Record{ recConHead = h }  -> [conName h]
+            Datatype{ dataCons = cs } -> map (qnameModule y,) cs
+
+            -- note about the module here: the record constructor lives
+            -- outside the record module, in the same module as the
+            -- record.
+            --
+            -- in debugging output, if the record being copied has a
+            -- generated constructor name, it's going to look like we
+            -- accidentally lost a layer of quantification, but that's
+            -- because record constructors get generated with a concrete
+            -- name that *looks* qualified
+            Record{ recConHead = h }  -> [(qnameModule y, conName h)]
+
             _                         -> []
 
 applySection' :: ModuleName -> Telescope -> ModuleName -> Args -> ScopeCopyInfo -> TCM ()
-applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = do
+applySection' new ptel old ts ren@ScopeCopyInfo{ renNames = rd, renModules = rm } = do
   do
     noCopyList <- catMaybes <$> mapM getName' constrainedPrims
     for_ (Map.keys rd) $ \ q ->
@@ -484,10 +546,30 @@ applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = 
     , "ptel =" <+> pretty ptel
     , "old  =" <+> pretty old
     , "ts   =" <+> pretty ts
+    , "ren  =" <+> pretty ren
     ]
+
+  whenProfile Profile.Sections do
+    oldn <- show <$> pretty old
+
+    let
+      ds = fromIntegral $ renamingSize rd
+      ms = fromIntegral $ renamingSize rm
+
+    tickMax "largest copied section" (ds + ms)
+    tickN   "copied definitions"     ds
+    tickN   ("copies for " <> oldn)  (ds + ms)
+
+  reportSLn "tc.mod.apply" 40 "applySection': copying definitions"
   _ <- Map.traverseWithKey (traverse . copyDef ts) rd
+
+  reportSLn "tc.mod.apply" 40 "applySection': copying modules"
   _ <- Map.traverseWithKey (traverse . copySec ts) rm
+
+  reportSLn "tc.mod.apply" 40 "applySection': computing polarities"
   computePolarity (Map.elems rd >>= List1.toList)
+
+  reportSLn "tc.mod.apply" 40 "finished applySection'"
   where
     -- Andreas, 2013-10-29
     -- Here, if the name x is not imported, it persists as
@@ -502,6 +584,8 @@ applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = 
     -- equivalent valid names and either can be used.
     copyName x = maybe x List1.head (Map.lookup x rd)
 
+    copyConHead c = c { conName = copyName (conName c) }
+
     argsToUse x = do
       let m = commonParentModule old x
       reportSDoc "tc.mod.apply" 80 $ "Common prefix: " <+> pretty m
@@ -511,10 +595,12 @@ applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = 
     copyDef ts x y = do
       def <- getConstInfo x
       np  <- argsToUse (qnameModule x)
+      origTel <- lookupSection $ qnameModule x
       -- Issue #3083: We need to use the hiding from the telescope of the
       -- original module. This can be different than the hiding for the common
       -- parent in the case of record modules.
-      hidings <- map getHiding . telToList <$> lookupSection (qnameModule x)
+      let hidings = map getHiding $ telToList origTel
+      -- This 'zipWith' sometimes silently drops arguments, see #8443
       let ts' = zipWith setHiding hidings ts
       commonTel <- lookupSection (commonParentModule old $ qnameModule x)
       reportSDoc "tc.mod.apply" 80 $ vcat
@@ -526,14 +612,18 @@ applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = 
       -- definition we get will have signature μ \ Δ → B.  This is only valid
       -- for pure modality systems though.
       let ai = defArgInfo def
-          m = unitModality { modCohesion = getCohesion ai }
-      localTC (over eContext (map (mapModality (m `inverseComposeModality`)))) $
+          m = unitModality { modCohesion = getCohesion ai
+                           , modPolarity = getModalPolarity ai
+                           }
+      localTC (over eContext (fmap (mapModality (m `inverseComposeModality`)))) $
         copyDef' ts' np def
+      reportSDoc "tc.mod.apply" 80 $
+        "finished copyDef" <+> pretty x <+> "->" <+> pretty y
       where
         copyDef' ts np d = do
           reportSDoc "tc.mod.apply" 60 $ "making new def for" <+> pretty y <+> "from" <+> pretty x <+> "with" <+> text (show np) <+> "args" <+> text (show $ defAbstract d)
           reportSDoc "tc.mod.apply" 80 $ vcat
-            [ "args = " <+> text (show ts')
+            [ "args = " <+> pretty ts
             , "old type = " <+> pretty (defType d) ]
           reportSDoc "tc.mod.apply" 80 $
             "new type = " <+> pretty t
@@ -545,7 +635,7 @@ applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = 
           -- Issue5583: Don't skip constructures, because the original constructor doesn't always
           -- work. For instance if it's only available in an anonymous module generated by
           -- `open import M args`.
-          whenJust inst $ \ c -> addNamedInstance y c
+          whenJust inst $ \_ -> addTypedInstance' False False inst empty y t
           -- Set display form for the old name if it's not a constructor.
 {- BREAKS fail/Issue478
           -- Andreas, 2012-10-20 and if we are not an anonymous module
@@ -562,7 +652,6 @@ applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = 
             t   = defType d `piApply` ts'
             pol = defPolarity d `apply` ts'
             occ = defArgOccurrences d `apply` ts'
-            gen = defArgGeneralizable d `apply` ts'
             inst = defInstance d
             -- the name is set by the addConstant function
             nd :: QName -> TCM Definition
@@ -576,7 +665,6 @@ applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = 
                     , defType           = t
                     , defPolarity       = pol
                     , defArgOccurrences = occ
-                    , defArgGeneralizable = gen
                     , defGeneralizedParams = [] -- This is only needed for type checking data/record defs so no need to copy it.
                     , defDisplay        = []
                     , defMutual         = -1   -- TODO: mutual block?
@@ -586,22 +674,24 @@ applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = 
                     , defMatchable      = Set.empty
                     , defNoCompilation  = defNoCompilation d
                     , defInjective      = False
-                    , defCopatternLHS   = isCopatternLHS [cl]
+                    , defCopatternLHS'  = isCopatternLHS [cl]
                     , defBlocked        = defBlocked d
                     , defLanguage       =
                       case defLanguage d of
                         -- Note that Cubical Agda code can be imported
-                        -- when --erased-cubical is used.
-                        l@(Cubical CFull) -> l
-                        Cubical CErased   -> lang
-                        WithoutK          -> lang
-                        WithK             -> lang
-                    , theDef            = df }
+                        -- when --cubical=erased is used.
+                        l@(Cubical CFull)    -> l
+                        Cubical CErased      -> lang
+                        Cubical CWithoutGlue -> lang
+                        WithoutK             -> lang
+                        WithK                -> lang
+                    , defMightContainMetas = True
+                    , theDef               = df }
             oldDef = theDef d
             isCon  = case oldDef of { Constructor{} -> True ; _ -> False }
             mutual = case oldDef of { Function{funMutual = m} -> m              ; _ -> Nothing }
             extlam = case oldDef of { Function{funExtLam = e} -> e              ; _ -> Nothing }
-            with   = case oldDef of { Function{funWith = w}   -> copyName <$> w ; _ -> Nothing }
+            with   = case oldDef of { Function{funWith = w}   -> copyName <$> w ; _ -> empty }
             -- Andreas, 2015-05-11, to fix issue 1413:
             -- Even if we apply the record argument (must be @var 0@), we stay a projection.
             -- This is because we may abstract the record argument later again.
@@ -632,16 +722,19 @@ applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = 
                          , dataClause = Just cl
                          , dataCons   = map copyName cs
                          }
-                Record{ recPars = np, recTel = tel } -> return $
+                Record{ recPars = np, recTel = tel, recConHead = c, recFields = fs } -> return $
                   oldDef { recPars    = np - size ts'
                          , recClause  = Just cl
                          , recTel     = apply tel ts'
+                         , recConHead = copyConHead c
+                         , recFields  = (map . fmap) copyName fs
                          }
-                GeneralizableVar -> return GeneralizableVar
+                GeneralizableVar gv -> return $ GeneralizableVar $ gv `apply` ts'
                 _ -> do
                   (mst, _, cc) <- compileClauses Nothing [cl] -- Andreas, 2012-10-07 non need for record pattern translation
                   fun          <- emptyFunctionData
                   let newDef =
+                        set funProj   (oldDef ^. funProj) $
                         set funMacro  (oldDef ^. funMacro) $
                         set funStatic (oldDef ^. funStatic) $
                         set funInline True $
@@ -666,9 +759,8 @@ applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = 
                             Function{funProjection = Right p} -> projDropParsApply p ProjSystem rel ts'
                             _ -> Def x $ map Apply ts'
                         , clauseType        = Just $ defaultArg t
-                        , clauseCatchall    = False
-                        , clauseExact       = Just True
-                        , clauseRecursive   = Just False -- definitely not recursive
+                        , clauseCatchall    = empty
+                        , clauseRecursive   = NotRecursive -- definitely not recursive
                         , clauseUnreachable = Just False -- definitely not unreachable
                         , clauseEllipsis    = NoEllipsis
                         , clauseWhereModule = Nothing
@@ -711,26 +803,31 @@ applySection' new ptel old ts ScopeCopyInfo{ renNames = rd, renModules = rm } = 
     -}
     copySec :: Args -> ModuleName -> ModuleName -> TCM ()
     copySec ts x y = do
+      reportSDoc "tc.mod.apply" 80 $ "Copying section" <+> pretty x <+> "to" <+> pretty y
       totalArgs <- argsToUse x
       tel       <- lookupSection x
-      let sectionTel =  apply tel $ take totalArgs ts
-      reportSDoc "tc.mod.apply" 80 $ "Copying section" <+> pretty x <+> "to" <+> pretty y
+      let sectionTel = apply tel $ take totalArgs ts
       reportSDoc "tc.mod.apply" 80 $ "  ts           = " <+> mconcat (List.intersperse "; " (map pretty ts))
       reportSDoc "tc.mod.apply" 80 $ "  totalArgs    = " <+> text (show totalArgs)
       reportSDoc "tc.mod.apply" 80 $ "  tel          = " <+> text (unwords (map (fst . unDom) $ telToList tel))  -- only names
       reportSDoc "tc.mod.apply" 80 $ "  sectionTel   = " <+> text (unwords (map (fst . unDom) $ telToList ptel)) -- only names
-      addContext sectionTel $ addSection y
+      ctxTel <- getContextTelescope
+      addSection' y (ctxTel `abstract` sectionTel)
+      reportSDoc "tc.mod.apply" 80 $
+        "finished copySec" <+> pretty x <+> "->" <+> pretty y
 
 -- | Add a display form to a definition (could be in this or imported signature).
 addDisplayForm :: QName -> DisplayForm -> TCM ()
 addDisplayForm x df = do
+  -- Check whether display form is recursive and thus illegal.
+  xs <- chaseDisplayForms df Set.empty
+  if x `Set.member` xs then warning $ InvalidDisplayForm x "it is recursive" else do
   d <- makeOpen df
   let add = updateDefinition x $ \ def -> def{ defDisplay = d : defDisplay def }
   ifM (isLocal x)
     {-then-} (modifySignature add)
-    {-else-} (stImportsDisplayForms `modifyTCLens` HMap.insertWith (++) x [d])
-  whenM (hasLoopingDisplayForm x) $
-    typeError . GenericDocError =<< do "Cannot add recursive display form for" <+> pretty x
+    {-else-} (stImportsDisplayForms `modifyTCLens` HMap.insertWith (<>) x (List1.singleton d))
+  reportSDoc "tc.display.section" 30 $ "Added display form for" <+> pretty x
 
 isLocal :: ReadTCState m => QName -> m Bool
 isLocal x = HMap.member x <$> useR (stSignature . sigDefinitions)
@@ -738,29 +835,55 @@ isLocal x = HMap.member x <$> useR (stSignature . sigDefinitions)
 getDisplayForms :: (HasConstInfo m, ReadTCState m) => QName -> m [LocalDisplayForm]
 getDisplayForms q = do
   ds  <- either (const []) defDisplay <$> getConstInfo' q
-  ds1 <- HMap.lookupDefault [] q <$> useR stImportsDisplayForms
-  ds2 <- HMap.lookupDefault [] q <$> useR stImportedDisplayForms
+  ds1 <- List1.toList' . HMap.lookup q <$> useR stImportsDisplayForms
+  ds2 <- List1.toList' . HMap.lookup q <$> useR stImportedDisplayForms
   ifM (isLocal q) (return $ ds ++ ds1 ++ ds2)
                   (return $ ds1 ++ ds ++ ds2)
 
--- | Find all names used (recursively) by display forms of a given name.
-chaseDisplayForms :: QName -> TCM (Set QName)
-chaseDisplayForms q = go Set.empty [q]
-  where
-    go :: Set QName        -- Accumulator.
-       -> [QName]          -- Work list.  TODO: make work set to avoid duplicate chasing?
-       -> TCM (Set QName)
-    go used []       = pure used
-    go used (q : qs) = do
-      let rhs (Display _ _ e) = e   -- Only look at names in the right-hand side (#1870)
-      let notYetUsed x = if x `Set.member` used then Set.empty else Set.singleton x
-      ds <- namesIn' notYetUsed . map (rhs . dget)
-            <$> (getDisplayForms q `catchError_` \ _ -> pure [])  -- might be a pattern synonym
-      go (Set.union ds used) (Set.toList ds ++ qs)
+hasDisplayForms :: (HasConstInfo m, ReadTCState m) => QName -> m Bool
+hasDisplayForms = fmap (not . null) . getDisplayForms
 
--- | Check if a display form is looping.
-hasLoopingDisplayForm :: QName -> TCM Bool
-hasLoopingDisplayForm q = Set.member q <$> chaseDisplayForms q
+-- | Find all names used (recursively) by display forms of a given name.
+--
+class ChaseDisplayForms a where
+  chaseDisplayForms ::
+       a                 -- ^ Search this recursively for display form names.
+    -> Set QName         -- ^ Already processed names (accumulator).
+    -> TCM (Set QName)   -- ^ Found names (superset of accumulator)
+
+instance ChaseDisplayForms QName where
+  chaseDisplayForms q used
+    | q `Set.member` used = return used
+    | otherwise           = do
+        reportSDoc "tc.display.recursive" 90 $ sep
+          [ "Chasing display form", prettyTCM q, "with accumulator", prettyTCM (Set.toList used) ]
+        xs <- getDisplayForms q `catchError_` const (pure [])  -- might be a pattern synonym
+        chaseDisplayForms xs (Set.insert q used)
+
+instance ChaseDisplayForms DisplayTerm where
+  chaseDisplayForms e used = do
+    let notYetUsed x = if x `Set.member` used then Set.empty else Set.singleton x
+    let ds = namesIn' notYetUsed e
+    chaseDisplayForms ds used
+
+instance ChaseDisplayForms DisplayForm where
+  -- Only look at names in the right-hand side (#1870)
+  chaseDisplayForms = chaseDisplayForms . dfRHS
+
+instance ChaseDisplayForms a => ChaseDisplayForms (Open a) where
+  chaseDisplayForms = chaseDisplayForms . openThing
+
+instance ChaseDisplayForms a => ChaseDisplayForms (Set a) where
+  chaseDisplayForms s = case Set.minView s of
+    Nothing      -> return
+    Just (x, s') -> chaseDisplayForms x >=> chaseDisplayForms s'
+
+instance ChaseDisplayForms a => ChaseDisplayForms [a] where
+  chaseDisplayForms []     = return
+  chaseDisplayForms (x:xs) = chaseDisplayForms x >=> chaseDisplayForms xs
+  -- NB: The following does not work because of lacking instance Ord LocalDisplayForm:
+  -- chaseDisplayForms = chaseDisplayForms . Set.toList
+
 
 canonicalName :: HasConstInfo m => QName -> m QName
 canonicalName x = do
@@ -806,7 +929,7 @@ data SigError
     -- Agda, but the current language is Erased Cubical Agda, and
     -- @--erasure@ is not active.
 
--- | Generates an error message corresponding to
+-- | Generates a string error message corresponding to
 -- 'SigCubicalNotErasure' for a given 'QName'.
 notSoPrettySigCubicalNotErasure :: QName -> String
 notSoPrettySigCubicalNotErasure q =
@@ -825,58 +948,107 @@ prettySigCubicalNotErasure q = fsep $
 
 -- | An eliminator for 'SigError'. All constructors except for
 -- 'SigAbstract' are assumed to be impossible.
-sigError :: (HasCallStack, MonadDebug m) => m a -> SigError -> m a
-sigError a = \case
+sigError :: (HasCallStack, MonadDebug m) => QName -> m a -> SigError -> m a
+sigError q a = \case
   SigUnknown s         -> __IMPOSSIBLE_VERBOSE__ s
   SigAbstract          -> a
-  SigCubicalNotErasure -> __IMPOSSIBLE__
+  SigCubicalNotErasure -> __IMPOSSIBLE_VERBOSE__ $
+    notSoPrettySigCubicalNotErasure q
 
 class ( Functor m
       , Applicative m
-      , Fail.MonadFail m
       , HasOptions m
       , MonadDebug m
       , MonadTCEnv m
       ) => HasConstInfo m where
   -- | Lookup the definition of a name. The result is a closed thing, all free
   --   variables have been abstracted over.
-  getConstInfo :: QName -> m Definition
-  getConstInfo q = getConstInfo' q >>= \case
+  getConstInfo :: HasCallStack => QName -> m Definition
+  getConstInfo q =
+    getConstInfo' q >>= \case
       Right d -> return d
-      Left (SigUnknown err) -> __IMPOSSIBLE_VERBOSE__ err
-      Left SigAbstract      -> __IMPOSSIBLE_VERBOSE__ $
+      Left err -> flip (sigError q) err $
+        __IMPOSSIBLE_VERBOSE__ $
         "Abstract, thus, not in scope: " ++ prettyShow q
-      Left SigCubicalNotErasure -> __IMPOSSIBLE_VERBOSE__ $
-        notSoPrettySigCubicalNotErasure q
 
   -- | Version that reports exceptions:
-  getConstInfo' :: QName -> m (Either SigError Definition)
+  getConstInfo' :: HasCallStack => QName -> m (Either SigError Definition)
   -- getConstInfo' q = Right <$> getConstInfo q -- conflicts with default signature
 
-  -- | Lookup the rewrite rules with the given head symbol.
-  getRewriteRulesFor :: QName -> m RewriteRules
+  -- | Return the global rewrite rules for the given head symbol that could be
+  --   tried.
+  --   Not categorically all rewrite rules are returned, in particular, none
+  --   when reduction of the head symbol is disabled.
+  --   Rewrite rules that only happen to be in the signature but are not in
+  --   scope are also not returned.
+  getGlobalRewriteRulesFor :: QName -> m GlobalRewriteRules
+
+  -- | Return the local rewrite rules for the given head symbol.
+  getLocalRewriteRulesFor :: RewriteHead -> m RewriteRules
 
   -- Lifting HasConstInfo through monad transformers:
 
   default getConstInfo'
-    :: (HasConstInfo n, MonadTrans t, m ~ t n)
+    :: (HasCallStack, HasConstInfo n, MonadTrans t, m ~ t n)
     => QName -> m (Either SigError Definition)
   getConstInfo' = lift . getConstInfo'
 
-  default getRewriteRulesFor
+  default getGlobalRewriteRulesFor
     :: (HasConstInfo n, MonadTrans t, m ~ t n)
-    => QName -> m RewriteRules
-  getRewriteRulesFor = lift . getRewriteRulesFor
+    => QName -> m GlobalRewriteRules
+  getGlobalRewriteRulesFor = lift . getGlobalRewriteRulesFor
 
-{-# SPECIALIZE getConstInfo :: QName -> TCM Definition #-}
+  default getLocalRewriteRulesFor
+    :: (HasConstInfo n, MonadTrans t, m ~ t n)
+    => RewriteHead -> m RewriteRules
+  getLocalRewriteRulesFor = lift . getLocalRewriteRulesFor
+{-# SPECIALIZE getConstInfo :: HasCallStack => QName -> TCM Definition #-}
 
+justTheRule :: GlobalRewriteRule -> Maybe RewriteRule
+justTheRule (GlobalRewriteRule _ g q ps rhs t isClause _)
+  | isClause  = Nothing
+  | otherwise = pure $ RewriteRule g (RewDefHead q)  ps rhs t
+
+{-# INLINE getAllRewriteRulesForDefHead #-}
+getAllRewriteRulesForDefHead :: (HasConstInfo m, ReadTCState m) => QName -> m RewriteRules
+getAllRewriteRulesForDefHead f = do
+  globals <- catMaybes . fmap justTheRule <$> (instantiateRewriteRules =<< getGlobalRewriteRulesFor f)
+  localRewritingOption >>= \case
+    True  -> do locals <- getLocalRewriteRulesFor (RewDefHead f)
+                pure $! globals ++! locals
+    False -> pure globals
+
+-- | A local rewrite rule forces us to consider the definition as defined
+--   by copatterns (see #3812 for an example case with global rewrite rules)
+--   This is necessary because binding local rewrite rules does not update
+--   defCopatternLHS'
+rewUsesCopatterns :: HasConstInfo m => RewriteHead -> m Bool
+rewUsesCopatterns h =
+  any lrewHasProjectionPattern <$> getLocalRewriteRulesFor h
+
+{-# INLINE defCopatternLHS #-}
+-- | Is this a function defined by copatterns?
+--   Accounts for local rewrite rules
+defCopatternLHS :: HasConstInfo m => QName -> Definition -> m Bool
+defCopatternLHS f d = localRewritingOption >>= \case
+  True -> do
+    rewForces <- rewUsesCopatterns $ RewDefHead f
+    pure $! defCopatternLHS' d || rewForces
+  False ->
+    pure $! defCopatternLHS' d
+
+{-# INLINE getAllRewriteRulesForVarHead #-}
+getAllRewriteRulesForVarHead :: HasConstInfo m
+  => Nat -> m RewriteRules
+getAllRewriteRulesForVarHead x = getLocalRewriteRulesFor $ RewVarHead x
+
+{-# SPECIALIZE getOriginalConstInfo :: HasCallStack => QName -> TCM Definition #-}
 -- | The computation 'getConstInfo' sometimes tweaks the returned
 -- 'Definition', depending on the current 'Language' and the
 -- 'Language' of the 'Definition'. This variant of 'getConstInfo' does
 -- not perform any tweaks.
-
 getOriginalConstInfo ::
-  (ReadTCState m, HasConstInfo m) => QName -> m Definition
+  (HasCallStack, ReadTCState m, HasConstInfo m) => QName -> m Definition
 getOriginalConstInfo q = do
   def  <- getConstInfo q
   lang <- getLanguage
@@ -888,67 +1060,103 @@ getOriginalConstInfo q = do
         (getConstInfo q)
     _ -> return def
 
-defaultGetRewriteRulesFor :: (ReadTCState m, MonadTCEnv m) => QName -> m RewriteRules
-defaultGetRewriteRulesFor q = ifNotM (shouldReduceDef q) (return []) $ do
+{-# SPECIALIZE defaultGetGlobalRewriteRulesFor :: QName -> ReduceM GlobalRewriteRules #-}
+-- | Return the rewrite rules for the given head symbol that could be tried.
+--   Not categorically all rewrite rules are returned, e.g. none when
+--   reduction of the head symbol is disabled.
+--   Rewrite rules that only happen to be in the signature but are not in scope
+--   are also not returned.
+defaultGetGlobalRewriteRulesFor :: (ReadTCState m, MonadTCEnv m)
+  => QName -> m GlobalRewriteRules
+defaultGetGlobalRewriteRulesFor q = ifNotM (shouldReduceDef q) (return []) $ do
+  getFilteredGlobalRewriteRulesFor True q
+
+{-# SPECIALIZE defaultGetLocalRewriteRulesFor :: RewriteHead -> TCM RewriteRules #-}
+defaultGetLocalRewriteRulesFor ::
+     (ReadTCState m, MonadTCEnv m, MonadDebug m, HasOptions m)
+  => RewriteHead -> m RewriteRules
+defaultGetLocalRewriteRulesFor h = localRewritingOption >>= \case
+  False -> pure []
+  True  -> do
+    ifNotM (shouldReduceDef' h) (return []) $ do
+      m <- runMaybeT . lookup h =<< viewTC eLocalRewriteRules
+      pure $ fromMaybe [] m
+    where
+      shouldReduceDef' (RewDefHead f) = shouldReduceDef f
+      shouldReduceDef' (RewVarHead _) = pure True
+
+      lookup h m = do
+        rews  <- MaybeT $ pure $ lookup' h m
+        lift $ traverse (tryGetOpenRew fallback) rews
+
+      fallback = __IMPOSSIBLE_VERBOSE__ . show
+
+      lookup' (RewDefHead f) = HMap.lookup   f . defHeadedRews
+      lookup' (RewVarHead x) = IntMap.lookup x . varHeadedRews
+
+-- | If the 'Bool' parameter is 'True', get the rules in scope,
+--   otherwise, get *all* rules unfiltered.
+getFilteredGlobalRewriteRulesFor :: (ReadTCState m)
+  => Bool            -- ^ Only return rewrite rules that are in scope?
+  -> QName           -- ^ Head symbol.
+  -> m GlobalRewriteRules  -- ^ Rules for the head symbol.
+getFilteredGlobalRewriteRulesFor filt q = do
   st <- getTCState
-  let sig = st^.stSignature
-      imp = st^.stImports
-      look s = HMap.lookup q $ s ^. sigRewriteRules
-  return $ mconcat $ catMaybes [look sig, look imp]
+  let
+    look :: Lens' TCState Signature -> Maybe GlobalRewriteRules
+    look l = HMap.lookup q $ st ^. (l . sigRewriteRules)
+
+  -- Restrict "imported" rewrite rules to those defined in modules we currently (transitively) import.
+  let imps = st ^. stImportedModulesTransitive
+  let inScope rew = grTopModule rew `Set.member` imps
+  let rewImported = applyWhen filt (filter inScope) <$> look stImports  -- stImports is actually a superset of imported symbols.
+
+  return $ mconcat $ catMaybes [look stSignature, rewImported]
 
 -- | Get the original name of the projection
 --   (the current one could be from a module application).
-getOriginalProjection :: HasConstInfo m => QName -> m QName
+getOriginalProjection :: (HasCallStack, HasConstInfo m) => QName -> m QName
 getOriginalProjection q = projOrig . fromMaybe __IMPOSSIBLE__ <$> isProjection q
 
-instance HasConstInfo (TCMT IO) where
-  getRewriteRulesFor = defaultGetRewriteRulesFor
+instance HasConstInfo TCM where
+  getGlobalRewriteRulesFor = defaultGetGlobalRewriteRulesFor
+  getLocalRewriteRulesFor  = defaultGetLocalRewriteRulesFor
   getConstInfo' q = do
     st  <- getTC
     env <- askTC
     defaultGetConstInfo st env q
   getConstInfo q = getConstInfo' q >>= \case
       Right d -> return d
-      Left (SigUnknown err)     -> fail err
+      Left (SigUnknown err)     -> internalError err
       Left SigAbstract          -> notInScopeError $ qnameToConcrete q
-      Left SigCubicalNotErasure ->
-        typeError . GenericDocError =<< prettySigCubicalNotErasure q
+      Left SigCubicalNotErasure -> typeError $ CubicalNotErasure q
 
 defaultGetConstInfo
-  :: (HasOptions m, MonadDebug m, MonadTCEnv m)
+  :: (HasCallStack, HasOptions m, MonadDebug m)
   => TCState -> TCEnv -> QName -> m (Either SigError Definition)
 defaultGetConstInfo st env q = do
-    let defs  = st^.(stSignature . sigDefinitions)
-        idefs = st^.(stImports . sigDefinitions)
-    case catMaybes [HMap.lookup q defs, HMap.lookup q idefs] of
-        []  -> return $ Left $ SigUnknown $ "Unbound name: " ++ prettyShow q ++ showQNameId q
-        [d] -> checkErasureFixQuantity d >>= \case
-                 Left err -> return (Left err)
-                 Right d  -> mkAbs env d
-        ds  -> __IMPOSSIBLE_VERBOSE__ $ "Ambiguous name: " ++ prettyShow q
+    let defs  = st ^. stSignature . sigDefinitions
+        idefs = st ^. stImports   . sigDefinitions
+        unambiguous d = checkErasureFixQuantity d >>= \case
+          Left err -> return $ Left err
+          Right d  -> mkAbs env d
+    case (HMap.lookup q defs, HMap.lookup q idefs) of
+      (Nothing, Nothing) -> return $ Left $ SigUnknown $ "Unbound name: " ++ prettyShow q ++ showQNameId q
+      (Just d, Nothing)  -> unambiguous d
+      (Nothing, Just d)  -> unambiguous d
+      _                  -> __IMPOSSIBLE_VERBOSE__ $ "Ambiguous name: " ++ prettyShow q
     where
       mkAbs env d
         -- Apply the reducibility rules (abstract, opaque) to check
         -- whether the definition should be hidden behind an
         -- 'AbstractDef'.
-        | not (isAccessibleDef env st d{defName = q'}) =
+        | not (isAccessibleDef env st d) =
           case alwaysMakeAbstract d of
             Just d      -> return $ Right d
             Nothing     -> return $ Left SigAbstract
-              -- the above can happen since the scope checker is a bit sloppy with 'abstract'
+            -- the above can happen since the scope checker is a bit sloppy with 'abstract'
         | otherwise = return $ Right d
-        where
-          q' = case theDef d of
-            -- Hack to make abstract constructors work properly. The constructors
-            -- live in a module with the same name as the datatype, but for 'abstract'
-            -- purposes they're considered to be in the same module as the datatype.
-            Constructor{} -> dropLastModule q
-            _             -> q
 
-          dropLastModule q@QName{ qnameModule = m } =
-            q{ qnameModule = mnameFromList $
-                 initWithDefault __IMPOSSIBLE__ $ mnameToList m
-             }
 
       -- Names defined in Cubical Agda may only be used in Erased
       -- Cubical Agda if --erasure is used. In that case they are (to
@@ -959,10 +1167,9 @@ defaultGetConstInfo st env q = do
            current == Cubical CErased
         then do
           erasure <- optErasure <$> pragmaOptions
-          return $
-            if erasure
-            then Right $ setQuantity zeroQuantity d
-            else Left SigCubicalNotErasure
+          if erasure
+            then return $! Right $! setQuantity zeroQuantity d
+            else return $ Left SigCubicalNotErasure
         else return $ Right d
 
 -- HasConstInfo lifts through monad transformers
@@ -976,19 +1183,23 @@ instance HasConstInfo m => HasConstInfo (MaybeT m)
 instance HasConstInfo m => HasConstInfo (ReaderT r m)
 instance HasConstInfo m => HasConstInfo (StateT s m)
 instance (Monoid w, HasConstInfo m) => HasConstInfo (WriterT w m)
+instance HasConstInfo m => HasConstInfo (Strict.ReaderT r m)
+instance HasConstInfo m => HasConstInfo (Strict.StateT s m)
+instance (Monoid w, HasConstInfo m) => HasConstInfo (Strict.WriterT w m)
 instance HasConstInfo m => HasConstInfo (BlockT m)
 
 {-# INLINE getConInfo #-}
-getConInfo :: HasConstInfo m => ConHead -> m Definition
+getConInfo :: (HasCallStack, HasConstInfo m) => ConHead -> m Definition
 getConInfo = getConstInfo . conName
 
+{-# INLINE getPolarity #-}
 -- | Look up the polarity of a definition.
-getPolarity :: HasConstInfo m => QName -> m [Polarity]
+getPolarity :: (HasCallStack, HasConstInfo m) => QName -> m [Polarity]
 getPolarity q = defPolarity <$> getConstInfo q
 
 -- | Look up polarity of a definition and compose with polarity
 --   represented by 'Comparison'.
-getPolarity' :: HasConstInfo m => Comparison -> QName -> m [Polarity]
+getPolarity' :: (HasCallStack, HasConstInfo m) => Comparison -> QName -> m [Polarity]
 getPolarity' CmpEq  q = map (composePol Invariant) <$> getPolarity q -- return []
 getPolarity' CmpLeq q = getPolarity q -- composition with Covariant is identity
 
@@ -1003,13 +1214,34 @@ setPolarity q pol = do
 getForcedArgs :: HasConstInfo m => QName -> m [IsForced]
 getForcedArgs q = defForced <$> getConstInfo q
 
+-- | Returns the occurences given explicitely as polarity annotations in the function type
+getOccurrencesFromType :: Type -> TCM [Occurrence]
+getOccurrencesFromType t = do
+  polarityEnabled <- optPolarity <$> pragmaOptions
+  if polarityEnabled then do
+    telList <- telToList . theTel <$> telView t
+    return $ modalPolarityToOccurrence . modPolarityAnn . getModalPolarity <$> telList
+  else return []
+
 -- | Get argument occurrence info for argument @i@ of definition @d@ (never fails).
-getArgOccurrence :: QName -> Nat -> TCM Occurrence
+getArgOccurrence :: HasCallStack => QName -> Nat -> TCM Occurrence
 getArgOccurrence d i = do
   def <- getConstInfo d
-  return $! case theDef def of
-    Constructor{} -> StrictPos
-    _             -> fromMaybe Mixed $ defArgOccurrences def !!! i
+  case theDef def of
+    Constructor{} -> return StrictPos
+
+    -- If the polarity checker has filled in the positivities of
+    -- arguments for this function then we believe it, because it should
+    -- agree with the signature.
+    _ | Just pol <- defArgOccurrences def !!! i ->
+      return pol
+
+    -- Otherwise we use them from the type. Since telView can do
+    -- reduction we'd rather not do this very often.
+    _ -> do
+      occs <- getOccurrencesFromType (defType def)
+
+      pure $! fromMaybe Mixed $ occs !!! i
 
 -- | Sets the 'defArgOccurrences' for the given identifier (which
 -- should already exist in the signature).
@@ -1019,6 +1251,13 @@ setArgOccurrences d os = modifyArgOccurrences d $ const os
 modifyArgOccurrences :: MonadTCState m => QName -> ([Occurrence] -> [Occurrence]) -> m ()
 modifyArgOccurrences d f =
   modifySignature $ updateDefinition d $ updateDefArgOccurrences f
+
+getArgOccurrences :: ReadTCState m => QName -> m [Occurrence]
+getArgOccurrences q = do
+  sig <- getSignature
+  case lookupDefinition q sig of
+    Nothing  -> __IMPOSSIBLE__
+    Just def -> pure (defArgOccurrences def)
 
 setTreeless :: QName -> TTerm -> TCM ()
 setTreeless q t =
@@ -1041,7 +1280,7 @@ getCompiled q = do
 
 -- | Returns a list of length 'conArity'.
 --   If no erasure analysis has been performed yet, this will be a list of 'False's.
-getErasedConArgs :: HasConstInfo m => QName -> m [Bool]
+getErasedConArgs :: (HasCallStack, HasConstInfo m) => QName -> m [Bool]
 getErasedConArgs q = do
   def <- getConstInfo q
   case theDef def of
@@ -1083,6 +1322,11 @@ getMutual_ = \case
     _ -> Nothing
 
 -- | Set the mutually recursive identifiers.
+--
+--   TODO: This produces data of quadratic size (which has to be processed upon serialization).
+--   Presumably qs is usually short, but in some cases (for instance for generated code) it may be
+--   long. It would be better to assign a unique identifier to each SCC, and store the names
+--   separately.
 setMutual :: QName -> [QName] -> TCM ()
 setMutual d m = modifySignature $ updateDefinition d $ updateTheDef $ \ def ->
   case def of
@@ -1095,7 +1339,7 @@ setMutual d m = modifySignature $ updateDefinition d $ updateTheDef $ \ def ->
 mutuallyRecursive :: QName -> QName -> TCM Bool
 mutuallyRecursive d d1 = (d `elem`) . fromMaybe __IMPOSSIBLE__ <$> getMutual d1
 
--- | A function/data/record definition is nonRecursive if it is not even mutually
+-- | A function, data, or record definition is definitely not recursive if it is not even mutually
 --   recursive with itself.
 definitelyNonRecursive_ :: Defn -> Bool
 definitelyNonRecursive_ = maybe False null . getMutual_
@@ -1116,11 +1360,11 @@ getDefModule f = mapRight modName <$> getConstInfo' f
 -- | Compute the number of free variables of a defined name. This is the sum of
 --   number of parameters shared with the current module and the number of
 --   anonymous variables (if the name comes from a let-bound module).
-getDefFreeVars :: (Functor m, Applicative m, ReadTCState m, MonadTCEnv m) => QName -> m Nat
+getDefFreeVars :: (ReadTCState m, MonadTCEnv m) => QName -> m Nat
 getDefFreeVars = getModuleFreeVars . qnameModule
 
-freeVarsToApply :: (Functor m, HasConstInfo m, HasOptions m,
-                    ReadTCState m, MonadTCEnv m, MonadDebug m)
+freeVarsToApply :: (HasConstInfo m,
+                    ReadTCState m)
                 => QName -> m Args
 freeVarsToApply q = do
   vs <- moduleParamsToApply $ qnameModule q
@@ -1137,8 +1381,8 @@ freeVarsToApply q = do
 
 {-# SPECIALIZE getModuleFreeVars :: ModuleName -> TCM Nat #-}
 {-# SPECIALIZE getModuleFreeVars :: ModuleName -> ReduceM Nat #-}
-getModuleFreeVars :: (Functor m, Applicative m, MonadTCEnv m, ReadTCState m)
-                  => ModuleName -> m Nat
+getModuleFreeVars :: ( MonadTCEnv m, ReadTCState m)
+                  =>ModuleName -> m Nat
 getModuleFreeVars m = do
   m0   <- commonParentModule m <$> currentModule
   (+) <$> getAnonymousVariables m <*> (size <$> lookupSection m0)
@@ -1157,9 +1401,9 @@ getModuleFreeVars m = do
 --        module M₃ Θ where
 --          ... M₁.M₂.f [insert Γ raised by Θ]
 --   @
-moduleParamsToApply :: (Functor m, Applicative m, HasOptions m,
+moduleParamsToApply :: ( HasOptions m,
                         MonadTCEnv m, ReadTCState m, MonadDebug m)
-                    => ModuleName -> m Args
+                    =>ModuleName -> m Args
 moduleParamsToApply m = do
 
   traceSDoc "tc.sig.param" 90 ("computing module parameters of " <+> pretty m) $ do
@@ -1223,33 +1467,35 @@ inFreshModuleIfFreeParams k = do
 --   context.
 {-# SPECIALIZE instantiateDef :: Definition -> TCM Definition #-}
 instantiateDef
-  :: ( Functor m, HasConstInfo m, HasOptions m
-     , ReadTCState m, MonadTCEnv m, MonadDebug m )
+  :: (HasConstInfo m, ReadTCState m )
   => Definition -> m Definition
 instantiateDef d = do
   vs  <- freeVarsToApply $ defName d
   verboseS "tc.sig.inst" 30 $ do
-    ctx <- getContext
+    ctx <- getContextNames
     m   <- currentModule
     reportSDoc "tc.sig.inst" 30 $
       "instDef in" <+> pretty m <> ":" <+> pretty (defName d) <+>
-      fsep (map pretty $ zipWith (<$) (reverse $ map (fst . unDom) ctx) vs)
+      fsep (map pretty $ zipWith (<$) ctx vs)
   return $ d `apply` vs
 
-instantiateRewriteRule :: (Functor m, HasConstInfo m, HasOptions m,
-                           ReadTCState m, MonadTCEnv m, MonadDebug m)
-                       => RewriteRule -> m RewriteRule
+-- | Instantiate a global rewrite rule
+instantiateRewriteRule :: (HasConstInfo m, ReadTCState m)
+  => GlobalRewriteRule -> m GlobalRewriteRule
 instantiateRewriteRule rew = do
-  traceSDoc "rewriting" 95 ("instantiating rewrite rule" <+> pretty (rewName rew) <+> "to the local context.") $ do
-  vs  <- freeVarsToApply $ rewName rew
+  traceSDoc "rewriting" 95
+    ("instantiating rewrite rule" <+>
+    pretty (grName rew) <+>
+    "to the local context.") $ do
+  vs  <- freeVarsToApply $ grName rew
   let rew' = rew `apply` vs
   traceSLn "rewriting" 95 ("instantiated rewrite rule: ") $ do
   traceSLn "rewriting" 95 (show rew') $ do
   return rew'
 
-instantiateRewriteRules :: (Functor m, HasConstInfo m, HasOptions m,
-                            ReadTCState m, MonadTCEnv m, MonadDebug m)
-                        => RewriteRules -> m RewriteRules
+-- | Instantiate global rewrite rules
+instantiateRewriteRules :: (HasConstInfo m, ReadTCState m)
+  => GlobalRewriteRules -> m GlobalRewriteRules
 instantiateRewriteRules = mapM instantiateRewriteRule
 
 -- | Return the abstract view of a definition, /regardless/ of whether
@@ -1281,33 +1527,33 @@ alwaysMakeAbstract d =
 -- | Enter abstract mode. Abstract definition in the current module are transparent.
 {-# SPECIALIZE inAbstractMode :: TCM a -> TCM a #-}
 inAbstractMode :: MonadTCEnv m => m a -> m a
-inAbstractMode = localTC $ \e -> e { envAbstractMode = AbstractMode }
+inAbstractMode = localTC (set eAbstractMode AbstractMode)
 
 -- | Not in abstract mode. All abstract definitions are opaque.
 {-# SPECIALIZE inConcreteMode :: TCM a -> TCM a #-}
 inConcreteMode :: MonadTCEnv m => m a -> m a
-inConcreteMode = localTC $ \e -> e { envAbstractMode = ConcreteMode }
+inConcreteMode = localTC (set eAbstractMode ConcreteMode)
 
 -- | Ignore abstract mode. All abstract definitions are transparent.
 ignoreAbstractMode :: MonadTCEnv m => m a -> m a
-ignoreAbstractMode = localTC $ \e -> e { envAbstractMode = IgnoreAbstractMode }
+ignoreAbstractMode = localTC (set eAbstractMode IgnoreAbstractMode)
 
 -- | Go under the given opaque block. The unfolding set will turn opaque
 -- definitions transparent.
 {-# SPECIALIZE underOpaqueId :: OpaqueId -> TCM a -> TCM a #-}
 underOpaqueId :: MonadTCEnv m => OpaqueId -> m a -> m a
-underOpaqueId i = localTC $ \e -> e { envCurrentOpaqueId = Just i }
+underOpaqueId i = localTC (set eCurrentOpaqueId (Just i))
 
 -- | Outside of any opaque blocks.
 {-# SPECIALIZE notUnderOpaque :: TCM a -> TCM a #-}
 notUnderOpaque :: MonadTCEnv m => m a -> m a
-notUnderOpaque = localTC $ \e -> e { envCurrentOpaqueId = Nothing }
+notUnderOpaque = localTC (set eCurrentOpaqueId Nothing)
 
 -- | Enter the reducibility environment associated with a definition:
 -- The environment will have the same concreteness as the name, and we
 -- will be in the opaque block enclosing the name, if any.
 {-# SPECIALIZE inConcreteOrAbstractMode :: QName -> (Definition -> TCM a) -> TCM a #-}
-inConcreteOrAbstractMode :: (MonadTCEnv m, HasConstInfo m) => QName -> (Definition -> m a) -> m a
+inConcreteOrAbstractMode :: (HasConstInfo m) => QName -> (Definition -> m a) -> m a
 inConcreteOrAbstractMode q cont = do
   -- Andreas, 2015-07-01: If we do not ignoreAbstractMode here,
   -- we will get ConcreteDef for abstract things, as they are turned into axioms.
@@ -1350,24 +1596,25 @@ droppedPars d = case theDef d of
     Constructor{conPars = n} -> n
     Primitive{}              -> 0
     PrimitiveSort{}          -> 0
-    AbstractDefn{}           -> __IMPOSSIBLE__
+    AbstractDefn{}           -> 0 -- not impossible when quoting, PR #7828
 
--- | Is it the name of a record projection?
+-- | Is it the name of a record projection or field or a projection-like function?
 {-# SPECIALIZE isProjection :: QName -> TCM (Maybe Projection) #-}
 isProjection :: HasConstInfo m => QName -> m (Maybe Projection)
 isProjection qn = isProjection_ . theDef <$> getConstInfo qn
 
+-- | Is it a record projection or field or a projection-like function?
 isProjection_ :: Defn -> Maybe Projection
-isProjection_ def =
-  case def of
+isProjection_ = \case
     Function { funProjection = Right result } -> Just result
     _                                         -> Nothing
 
--- | Is it the name of a non-irrelevant record projection?
+-- | Is it the name of a non-irrelevant record projection or field or projection-like function?
 {-# SPECIALIZE isProjection :: QName -> TCM (Maybe Projection) #-}
 isRelevantProjection :: HasConstInfo m => QName -> m (Maybe Projection)
 isRelevantProjection qn = isRelevantProjection_ <$> getConstInfo qn
 
+-- | Is it a non-irrelevant record projection or field or projection-like function?
 isRelevantProjection_ :: Definition -> Maybe Projection
 isRelevantProjection_ def =
   if isIrrelevant def then Nothing else isProjection_ $ theDef def
@@ -1384,8 +1631,13 @@ isInlineFun = (^. funInline)
 --   i.e., not a projection-like function nor a record field value
 --   (projection applied to argument).
 isProperProjection :: Defn -> Bool
-isProperProjection d = caseMaybe (isProjection_ d) False $ \ isP ->
-  (projIndex isP > 0) && isJust (projProper isP)
+isProperProjection = maybe False isProperProjection_ . isProjection_
+
+-- | Returns @True@ if we are dealing with a proper projection,
+--   i.e., not a projection-like function nor a record field value
+--   (projection applied to argument).
+isProperProjection_ :: Projection -> Bool
+isProperProjection_ isP = projIndex isP > 0 && isJust (projProper isP)
 
 -- | Number of dropped initial arguments of a projection(-like) function.
 projectionArgs :: Definition -> Int
@@ -1393,7 +1645,7 @@ projectionArgs = maybe 0 (max 0 . pred . projIndex) . isRelevantProjection_
 
 -- | Check whether a definition uses copatterns.
 usesCopatterns :: (HasConstInfo m) => QName -> m Bool
-usesCopatterns q = defCopatternLHS <$> getConstInfo q
+usesCopatterns q = defCopatternLHS q =<< getConstInfo q
 
 -- | Apply a function @f@ to its first argument, producing the proper
 --   postfix projection if @f@ is a projection which is not irrelevant.

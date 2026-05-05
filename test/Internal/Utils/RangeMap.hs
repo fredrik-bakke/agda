@@ -8,11 +8,6 @@ module Internal.Utils.RangeMap
   )
   where
 
-import Agda.Interaction.Highlighting.Range
-import Agda.Utils.Null
-import Agda.Utils.RangeMap
-import Agda.Utils.Tuple
-
 import Prelude hiding (null, splitAt)
 
 import qualified Data.IntMap as IntMap
@@ -20,8 +15,11 @@ import qualified Data.IntSet as IntSet
 import Data.List (sort)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
-import Data.Semigroup
-import Data.Strict.Tuple (Pair(..))
+
+import Agda.Interaction.Highlighting.Range
+import Agda.Utils.List (allConsecutive)
+import Agda.Utils.Null
+import Agda.Utils.RangeMap
 
 import Internal.Helpers
 import Internal.Interaction.Highlighting.Range ()
@@ -57,7 +55,7 @@ intersectsSplits r f =
   rangeContainingPoint' p = case Map.splitLookup p (rangeMap f) of
     (_,       Just _,  _) -> Nothing
     (smaller, Nothing, _) -> case Map.lookupMax smaller of
-      Just (p1, PairInt (p2 :!: _))
+      Just (p1, p2 :!: _)
         | p1 < p && p < p2 -> Just p2
       _                    -> Nothing
 
@@ -84,10 +82,7 @@ toListProperty f =
   where
   rms = toList f
   rs  = map fst rms
-
-  increasing [] = True
-  increasing rs =
-    and $ zipWith (<=) (map to $ init rs) (map from $ tail rs)
+  increasing = allConsecutive \ r r' -> to r <= from r'
 
 -- | A property that should be satisfied by 'coveringRange'.
 
@@ -290,14 +285,14 @@ prop_monoid = isMonoid
 ------------------------------------------------------------------------
 -- Generators
 
-instance (Arbitrary a, Semigroup a) => Arbitrary (RangeMap a) where
+instance (Arbitrary a) => Arbitrary (RangeMap a) where
   arbitrary = smaller 5 $ do
     rs <- (\ns1 ns2 ->
             toRanges $ sort $
             ns1 ++ concatMap (\n -> [n, succ n]) (ns2 :: [Int])) <$>
             arbitrary <*> arbitrary
     RangeMap . Map.fromList <$>
-      mapM (\r -> (\m -> (from r, PairInt (to r :!: m))) <$> arbitrary)
+      mapM (\r -> (\m -> (from r, to r :!: m)) <$> arbitrary)
         rs
     where
     toRanges (f : t : rs)
@@ -312,17 +307,17 @@ instance (Arbitrary a, Semigroup a) => Arbitrary (RangeMap a) where
     [ RangeMap (Map.deleteAt i (rangeMap f))
     | i <- [0 .. Map.size (rangeMap f) - 1]
     ] ++
-    [ RangeMap (Map.updateAt (\_ _ -> Just (PairInt (p :!: x)))
+    [ RangeMap (Map.updateAt (\_ _ -> Just (p :!: x))
                   i (rangeMap f))
     | i <- [0 .. Map.size (rangeMap f) - 1]
-    , let (_, PairInt (p :!: x)) = Map.elemAt i (rangeMap f)
+    , let (_, p :!: x) = Map.elemAt i (rangeMap f)
     , x <- shrink x
     ]
 
 instance CoArbitrary a => CoArbitrary (RangeMap a) where
   coarbitrary (RangeMap f) =
     coarbitrary $
-    fmap (mapSnd (\(PairInt (x :!: y)) -> (x, y))) $
+    fmap (fmap (\ (x :!: y) -> (x, y))) $
     Map.toAscList f
 
 -- | A range that is entirely inside a given 'RangeMap'.

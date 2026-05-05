@@ -1,6 +1,6 @@
-{-# LANGUAGE CPP #-}
 
 -- | Logically consistent comparison of floating point numbers.
+
 module Agda.Utils.Float
   ( asFinite
   , isPosInf
@@ -55,25 +55,8 @@ import Data.Word        ( Word64 )
 
 import Agda.Utils.List  ( stripSuffix )
 
-#if __GLASGOW_HASKELL__ >= 804
 import GHC.Float (castDoubleToWord64, castWord64ToDouble)
-#else
-import System.IO.Unsafe (unsafePerformIO)
-import qualified Foreign          as F
-import qualified Foreign.Storable as F
-#endif
 
-#if __GLASGOW_HASKELL__ < 804
-castDoubleToWord64 :: Double -> Word64
-castDoubleToWord64 float = unsafePerformIO $ F.alloca $ \buf -> do
-  F.poke (F.castPtr buf) float
-  F.peek buf
-
-castWord64ToDouble :: Word64 -> Double
-castWord64ToDouble word = unsafePerformIO $ F.alloca $ \buf -> do
-  F.poke (F.castPtr buf) word
-  F.peek buf
-#endif
 
 {-# INLINE doubleEq #-}
 doubleEq :: Double -> Double -> Bool
@@ -182,9 +165,10 @@ doubleACosh = acosh -- NOTE: doesn't cause underflow/overflow
 doubleATanh :: Double -> Double
 doubleATanh = atanh -- NOTE: doesn't cause underflow/overflow
 
-{-# INLINE negativeZero #-}
-negativeZero :: Double
-negativeZero = -0.0
+-- UNUSED:
+-- {-# INLINE negativeZero #-}
+-- negativeZero :: Double
+-- negativeZero = -0.0
 
 positiveInfinity :: Double
 positiveInfinity = 1.0 / 0.0
@@ -216,10 +200,11 @@ doubleFloor = fmap floor . asFinite
 doubleCeiling :: Double -> Maybe Integer
 doubleCeiling = fmap ceiling . asFinite
 
-normaliseNaN :: Double -> Double
-normaliseNaN x
-  | isNaN x   = nan
-  | otherwise = x
+-- UNUSED:
+-- normaliseNaN :: Double -> Double
+-- normaliseNaN x
+--   | isNaN x   = nan
+--   | otherwise = x
 
 doubleToWord64 :: Double -> Maybe Word64
 doubleToWord64 x

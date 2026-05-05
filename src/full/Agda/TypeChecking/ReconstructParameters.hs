@@ -23,16 +23,16 @@ import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Records
 import Agda.TypeChecking.Datatypes
 
-import Agda.Utils.Size
 import Agda.Utils.Either
 import Agda.Utils.Function (applyWhen)
+import Agda.Utils.Size
 
 import Agda.Utils.Impossible
 
 reconstructParametersInType :: Type -> TCM Type
 reconstructParametersInType = reconstructParametersInType' defaultAction
 
-reconstructParametersInType' :: Action TCM -> Type -> TCM Type
+reconstructParametersInType' :: Action -> Type -> TCM Type
 reconstructParametersInType' act a =
   traverse (reconstructParameters' act (sort $ getSort a)) a
 
@@ -44,8 +44,8 @@ reconstructParametersInTel (ExtendTel a tel) = do
     ExtendTel (ar <$ a) <$> traverse reconstructParametersInTel tel
 
 reconstructParametersInEqView :: EqualityView -> TCM EqualityView
-reconstructParametersInEqView (EqualityType s eq l a u v) =
-  EqualityType s eq l <$> traverse (reconstructParameters $ sort s) a
+reconstructParametersInEqView (EqualityType r s eq l a u v) =
+  EqualityType r s eq l <$> traverse (reconstructParameters $ sort s) a
                       <*> traverse (reconstructParameters $ El s $ unArg a) u
                       <*> traverse (reconstructParameters $ El s $ unArg a) v
 reconstructParametersInEqView (OtherType a) = OtherType <$> reconstructParametersInType a
@@ -54,7 +54,7 @@ reconstructParametersInEqView (IdiomType a) = IdiomType <$> reconstructParameter
 reconstructParameters :: Type -> Term -> TCM Term
 reconstructParameters = reconstructParameters' defaultAction
 
-reconstructParameters' :: Action TCM -> Type -> Term -> TCM Term
+reconstructParameters' :: Action -> Type -> Term -> TCM Term
 reconstructParameters' act a v = do
   reportSDoc "tc.reconstruct" 30 $
     sep [ "reconstructing parameters in"
@@ -65,10 +65,10 @@ reconstructParameters' act a v = do
     nest 2 $ "-->" <+> prettyTCM v
   return v
 
-reconstructAction :: Action TCM
+reconstructAction :: Action
 reconstructAction = reconstructAction' defaultAction
 
-reconstructAction' :: Action TCM -> Action TCM
+reconstructAction' :: Action -> Action
 reconstructAction' act = act{ postAction = \ty tm -> postAction act ty tm >>= reconstruct ty }
 
 reconstruct :: Type -> Term -> TCM Term
@@ -156,8 +156,8 @@ extractParameters q ty = reduce (unEl ty) >>= \case
        -- Case: regular projection
        | isProperProjection (theDef info) ->
          case theDef info of
-           Function{ funErasure = e } ->
-             return $ map (mkParam e) postPs
+           d@Function{} ->
+             return $ map (mkParam (d ^. funErasure)) postPs
            _ -> __IMPOSSIBLE__
        -- Case: projection-like function
        | otherwise -> do

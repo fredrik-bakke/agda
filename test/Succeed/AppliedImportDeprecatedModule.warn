@@ -1,0 +1,12 @@
+
+AppliedImportDeprecatedModule.agda:4.6-34: warning: -W[no]UserWarning
+Deprecated module
+when scope checking the declaration
+  open import Deprecated.Deprecated Set
+
+———— All done; warnings encountered ————————————————————————
+
+AppliedImportDeprecatedModule.agda:4.6-34: warning: -W[no]UserWarning
+Deprecated module
+when scope checking the declaration
+  open import Deprecated.Deprecated Set

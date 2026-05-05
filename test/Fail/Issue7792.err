@@ -1,0 +1,7 @@
+Issue7792.agda:29.5-9: error: [UnequalTerms]
+The terms
+  x
+and
+  inc 1 2
+are not equal at type Foo
+when checking that the expression refl has type x ≡ inc 1 2

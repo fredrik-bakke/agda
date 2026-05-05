@@ -1,4 +1,8 @@
-Issue628.agda:25,37-41
-0 != 1 of type ℕ
+Issue628.agda:25.37-41: error: [UnequalTerms]
+The terms
+  0
+and
+  1
+are not equal at type ℕ
 when checking that the expression refl has type
 0 ≡ suc (divSucAux 0 0 0 1)

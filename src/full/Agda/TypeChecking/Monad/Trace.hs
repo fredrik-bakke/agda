@@ -1,17 +1,21 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
+{-# LANGUAGE MagicHash #-}
 
 module Agda.TypeChecking.Monad.Trace where
 
 import Prelude hiding (null)
 
-import Control.Monad.Except
-import Control.Monad.Reader
-import Control.Monad.State
-import Control.Monad.Trans.Identity
-import Control.Monad.Writer
+import Control.Monad.Except         ( ExceptT  (ExceptT  ), runExceptT   , throwError )
+import Control.Monad.Reader         ( ReaderT  (ReaderT  ), runReaderT   )
+import Control.Monad.State          ( StateT   (StateT   ), runStateT    )
+import Control.Monad.Trans.Identity ( IdentityT(IdentityT), runIdentityT )
+import Control.Monad.Trans.Maybe    ( MaybeT   (MaybeT   ), runMaybeT    )
+import Control.Monad.Writer         ( WriterT  (WriterT  ), runWriterT   )
 
 import qualified Data.Set as Set
 
+import Agda.Syntax.Common.Pretty
+import Agda.Syntax.Parser (PM, runPMIO)
 import Agda.Syntax.Position
 import qualified Agda.Syntax.Position as P
 
@@ -23,13 +27,15 @@ import Agda.TypeChecking.Monad.Base
   hiding (ModuleInfo, MetaInfo, Primitive, Constructor, Record, Function, Datatype)
 import Agda.TypeChecking.Monad.Debug
 import Agda.TypeChecking.Monad.State
+import Agda.TypeChecking.Warnings (warning)
 
 import Agda.Utils.Function
-
-import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.Monad
 import Agda.Utils.Null
-import Agda.Syntax.Common.Pretty (prettyShow)
+
+import Agda.Utils.StrictReader qualified as Strict
+import Agda.Utils.StrictWriter qualified as Strict
+import Agda.Utils.StrictState  qualified as Strict
 
 ---------------------------------------------------------------------------
 -- * Trace
@@ -63,12 +69,14 @@ interestingCall = \case
     CheckRecDef{}             -> True
     CheckConstructor{}        -> True
     CheckIApplyConfluence{}   -> True
+    CheckLocalRewriteConstraint{} -> True
     CheckConArgFitsIn{}       -> True
     CheckFunDefCall{}         -> True
     CheckPragma{}             -> True
     CheckPrimitive{}          -> True
     CheckIsEmpty{}            -> True
     CheckConfluence{}         -> True
+    CheckModuleParameters{}   -> True
     CheckWithFunctionType{}   -> True
     CheckSectionApplication{} -> True
     CheckNamedWhere{}         -> True
@@ -80,25 +88,35 @@ interestingCall = \case
 
 class (MonadTCEnv m, ReadTCState m) => MonadTrace m where
 
+  {-# INLINE traceCall #-}
   -- | Record a function call in the trace.
   traceCall :: Call -> m a -> m a
   traceCall call m = do
     cl <- buildClosure call
     traceClosureCall cl m
 
+  {-# INLINE traceCallM #-}
   traceCallM :: m Call -> m a -> m a
   traceCallM call m = flip traceCall m =<< call
 
-  -- | Reset 'envCall' to previous value in the continuation.
+  {-# INLINE traceCallCPS #-}
+  -- | Like 'traceCall', but resets 'envCall' and the current ranges to the
+  --   previous values in the continuation.
   --
-  -- Caveat: if the last 'traceCall' did not set an 'interestingCall',
-  -- for example, only set the 'Range' with 'SetRange',
-  -- we will revert to the last interesting call.
   traceCallCPS :: Call -> ((a -> m b) -> m b) -> ((a -> m b) -> m b)
   traceCallCPS call k ret = do
-    mcall <- asksTC envCall
-    traceCall call $ k $ \ a -> do
-      maybe id traceClosureCall mcall $ ret a
+
+    -- Save current call and ranges.
+    e <- askTC
+    let mcall = e ^. eCall
+        r     = e ^. eRange
+        hr    = e ^. eHighlightingRange
+
+    -- Run given computation under given call.
+    traceCall call $ k $ \a -> do
+
+      -- Restore previous call and ranges for the continuation.
+      localTC (set eCall mcall . set eRange r . set eHighlightingRange hr) $ ret a
 
   traceClosureCall :: Closure Call -> m a -> m a
 
@@ -110,8 +128,14 @@ class (MonadTCEnv m, ReadTCState m) => MonadTrace m where
     => RemoveTokenBasedHighlighting -> HighlightingInfo -> m ()
   printHighlightingInfo r i = lift $ printHighlightingInfo r i
 
+traceCallCPS' :: MonadTrace m => Call -> (m b -> m b) -> m b -> m b
+traceCallCPS' c k ret = traceCallCPS c (\ret -> k (ret ())) (\() -> ret)
+
 instance MonadTrace m => MonadTrace (IdentityT m) where
   traceClosureCall c f = IdentityT $ traceClosureCall c $ runIdentityT f
+
+instance MonadTrace m => MonadTrace (MaybeT m) where
+  traceClosureCall c f = MaybeT $ traceClosureCall c $ runMaybeT f
 
 instance MonadTrace m => MonadTrace (ReaderT r m) where
   traceClosureCall c f = ReaderT $ \r -> traceClosureCall c $ runReaderT f r
@@ -122,6 +146,15 @@ instance MonadTrace m => MonadTrace (StateT s m) where
 instance (MonadTrace m, Monoid w) => MonadTrace (WriterT w m) where
   traceClosureCall c f = WriterT $ traceClosureCall c $ runWriterT f
 
+instance MonadTrace m => MonadTrace (Strict.ReaderT r m) where
+  traceClosureCall c f = Strict.ReaderT $ \r -> traceClosureCall c $ Strict.runReaderT f r
+
+instance MonadTrace m => MonadTrace (Strict.StateT s m) where
+  traceClosureCall c f = Strict.StateT (traceClosureCall c . Strict.runStateT# f)
+
+instance (MonadTrace m, Monoid w) => MonadTrace (Strict.WriterT w m) where
+  traceClosureCall c (Strict.WriterT f) = Strict.WriterT $ traceClosureCall c f
+
 instance MonadTrace m => MonadTrace (ExceptT e m) where
   traceClosureCall c f = ExceptT $ traceClosureCall c $ runExceptT f
 
@@ -131,33 +164,19 @@ instance MonadTrace TCM where
     -- Since the fix of #2092 we may report an error outside the current file.
     -- (For instance, if we import a module which then happens to have the
     -- wrong name.)
-    -- Thus, we no longer crash, but just report the alien range.
-    -- -- Andreas, 2015-02-09 Make sure we do not set a range
-    -- -- outside the current file
-    verboseS "check.ranges" 90 $
-      Strict.whenJust (rangeFile callRange) $ \f -> do
-        currentFile <- asksTC envCurrentPath
-        when (currentFile /= Just (rangeFilePath f)) $ do
-          reportSLn "check.ranges" 90 $
-            prettyShow call ++
-            " is setting the current range to " ++ show callRange ++
-            " which is outside of the current file " ++ show currentFile
 
     -- Compute update to 'Range' and 'Call' components of 'TCEnv'.
     let withCall = localTC $ foldr (.) id $ concat $
-          [ [ \e -> e { envCall = Just cl } | interestingCall call ]
-          , [ \e -> e { envHighlightingRange = callRange }
-            | callHasRange && highlightCall
-              || isNoHighlighting
-            ]
-          , [ \e -> e { envRange = callRange } | callHasRange ]
+          [ [ set eCall (Just cl) | interestingCall call ]
+          , [ set eHighlightingRange callRange | callHasRange && highlightCall || isNoHighlighting ]
+          , [ set eRange callRange  | callHasRange ]
           ]
 
     -- For interactive highlighting, also wrap computation @m@ in 'highlightAsTypeChecked':
-    ifNotM (pure highlightCall `and2M` do (Interactive ==) . envHighlightingLevel <$> askTC)
+    ifNotM (pure highlightCall `and2M` (Interactive ==) <$> viewTC eHighlightingLevel)
       {-then-} (withCall m)
       {-else-} $ do
-        oldRange <- envHighlightingRange <$> askTC
+        oldRange <- viewTC eHighlightingRange
         highlightAsTypeChecked oldRange callRange $
           withCall m
     where
@@ -187,12 +206,14 @@ instance MonadTrace TCM where
       CheckRecDef{}             -> True
       CheckConstructor{}        -> True
       CheckConArgFitsIn{}       -> False
-      CheckFunDefCall _ _ _ h   -> h
+      CheckFunDefCall _ _ h     -> h
       CheckPragma{}             -> True
       CheckPrimitive{}          -> True
       CheckIsEmpty{}            -> True
       CheckConfluence{}         -> False
       CheckIApplyConfluence{}   -> False
+      CheckLocalRewriteConstraint{} -> False
+      CheckModuleParameters{}   -> False
       CheckWithFunctionType{}   -> True
       CheckSectionApplication{} -> True
       CheckNamedWhere{}         -> False
@@ -209,12 +230,13 @@ instance MonadTrace TCM where
       _ -> False
 
   printHighlightingInfo remove info = do
-    modToSrc <- useTC stModuleToSource
+    modToSrc <- useSession lensModuleToSource
     method   <- viewTC eHighlightingMethod
-    reportS "highlighting" 50
+    reportSDoc "highlighting" 90 $ pure $ vcat
       [ "Printing highlighting info:"
-      , show info
-      , "  modToSrc = " ++ show modToSrc
+      , nest 2 $ (text . show) info
+      , "File modules:"
+      , nest 2 $ pretty modToSrc
       ]
     unless (null info) $ do
       appInteractionOutputCallback $
@@ -222,7 +244,7 @@ instance MonadTrace TCM where
 
 
 getCurrentRange :: MonadTCEnv m => m Range
-getCurrentRange = asksTC envRange
+getCurrentRange = viewTC eRange
 
 -- | Sets the current range (for error messages etc.) to the range
 --   of the given object, if it has a range (i.e., its range is not 'noRange').
@@ -265,3 +287,26 @@ highlightAsTypeChecked rPre r m
     return v
     where
     p rs x = printHighlightingInfo KeepHighlighting (singleton rs x)
+
+---------------------------------------------------------------------------
+-- * Warnings in the parser
+---------------------------------------------------------------------------
+
+-- | Running the Parse monad, raising parser warnings.
+
+runPM :: PM a -> TCM a
+runPM m = do
+  (res, ws) <- runPMIO m
+  forM_ ws \ w -> setCurrentRange w $ warning $ ParseWarning w
+  case res of
+    Left  e -> throwError $ ParserError e
+    Right a -> return a
+
+-- | Running the Parse monad, dropping parser warnings.
+
+runPMDropWarnings :: PM a -> TCM a
+runPMDropWarnings m = do
+  (res, _ws) <- runPMIO m
+  case res of
+    Left  e -> throwError $ ParserError e
+    Right a -> return a

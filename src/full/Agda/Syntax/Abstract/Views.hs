@@ -6,25 +6,26 @@ import Prelude hiding (null)
 import Control.Applicative ( Const(Const), getConst )
 import Control.Monad.Identity
 
+import Data.Bifunctor (second)
 import Data.Foldable (foldMap)
-import qualified Data.DList as DL
-import Data.Semigroup ((<>))
+import Data.DList qualified as DL
 import Data.Void
 
 import Agda.Syntax.Common
 import Agda.Syntax.Abstract as A
-import Agda.Syntax.Concrete (FieldAssignment', exprFieldA)
+import Agda.Syntax.Concrete (FieldAssignment', exprFieldA, TacticAttribute')
 import Agda.Syntax.Info
-import Agda.Syntax.Scope.Base (KindOfName(..), conKindOfName, WithKind(..))
+import Agda.Syntax.Scope.Base (conKindOfName, WithKind(..))
 
 import Agda.Utils.Either
 import Agda.Utils.List1 (List1)
+import Agda.Utils.List1 qualified as List1
 import Agda.Utils.Null
 import Agda.Utils.Singleton
 
 import Agda.Utils.Impossible
 
-
+-- | An 'Expr' viewed as application.
 data AppView' arg = Application Expr [NamedArg arg]
   deriving (Functor)
 
@@ -32,31 +33,39 @@ type AppView = AppView' Expr
 
 -- | Gather applications to expose head and spine.
 --
---   Note: everything is an application, possibly of itself to 0 arguments
+--   Note:
+--
+--   1. Everything is an application, possibly of itself to 0 arguments.
+--
+--   2. If the returned head is a projection originating from a post-fix
+--      projection, the 'ArgInfo' of the first argument might be incorrect.
+--      (See issue #8300.)
+--      For instance @x .f@ is valid postfix syntax for @f {{x}}@,
+--      but 'appView' turns the former into @f x@.
+--      The correct @f {{x}}@ is produced by 'Agda.TypeChecking.Rules.Term.appViewM'.
 appView :: Expr -> AppView
 appView = fmap snd . appView'
 
 appView' :: Expr -> AppView' (AppInfo, Expr)
 appView' e = f (DL.toList es)
   where
-  (f, es) = appView'' e
-
-  appView'' e = case e of
+  (f, es) = go e
+  go = \case
     App i e1 e2
       | Dot _ e2' <- unScope $ namedArg e2
-      , Just f <- maybeProjTurnPostfix e2'
+      , Just (_, f) <- maybeProjTurnPostfix e2'
       , getHiding e2 == NotHidden -- Jesper, 2018-12-13: postfix projections shouldn't be hidden
       -> (Application f, singleton (defaultNamedArg (i, e1)))
-    App i e1 arg | (f, es) <- appView'' e1 ->
+    App i e1 arg | (f, es) <- go e1 ->
       (f, es `DL.snoc` (fmap . fmap) (i,) arg)
-    ScopedExpr _ e -> appView'' e
-    _              -> (Application e, mempty)
+    ScopedExpr _ e -> go e
+    e -> (Application e, mempty)
 
-maybeProjTurnPostfix :: Expr -> Maybe Expr
+maybeProjTurnPostfix :: Expr -> Maybe (AmbiguousQName, Expr)
 maybeProjTurnPostfix e =
   case e of
-    ScopedExpr i e' -> ScopedExpr i <$> maybeProjTurnPostfix e'
-    Proj _ x        -> return $ Proj ProjPostfix x
+    ScopedExpr i e' -> second (ScopedExpr i) <$> maybeProjTurnPostfix e'
+    Proj _ x        -> return (x, Proj ProjPostfix x)
     _               -> Nothing
 
 unAppView :: AppView -> Expr
@@ -84,11 +93,10 @@ piView = \case
 unPiView :: PiView -> Expr
 unPiView (PiView tels t) = foldr (uncurry Pi) t tels
 
--- | Gather top-level 'AsP'atterns and 'AnnP'atterns to expose underlying pattern.
-asView :: A.Pattern -> ([Name], [A.Expr], A.Pattern)
-asView (A.AsP _ x p)  = (\(asb, ann, p) -> (unBind x : asb, ann, p)) $ asView p
-asView (A.AnnP _ a p) = (\(asb, ann, p) -> (asb, a : ann, p))        $ asView p
-asView p              = ([], [], p)
+-- | Gather top-level 'AsP'atterns to expose underlying pattern.
+asView :: A.Pattern -> ([Name], A.Pattern)
+asView (A.AsP _ x p)  = (\(asb, p) -> (unBind x : asb, p)) $ asView p
+asView p              = ([], p)
 
 -- | Remove top 'ScopedExpr' wrappers.
 unScope :: Expr -> Expr
@@ -104,19 +112,33 @@ unScope e                    = e
 deepUnscope :: ExprLike a => a -> a
 deepUnscope = mapExpr unScope
 
-deepUnscopeDecls :: [A.Declaration] -> [A.Declaration]
-deepUnscopeDecls = concatMap deepUnscopeDecl
+class DeepUnscopeDecls t where
+  deepUnscopeDecls :: t A.Declaration -> t A.Declaration
 
-deepUnscopeDecl :: A.Declaration -> [A.Declaration]
+instance DeepUnscopeDecls [] where
+  deepUnscopeDecls :: [A.Declaration] -> [A.Declaration]
+  deepUnscopeDecls = foldMap (List1.toList . deepUnscopeDecl)
+
+instance DeepUnscopeDecls List1 where
+  deepUnscopeDecls :: List1 A.Declaration -> List1 A.Declaration
+  deepUnscopeDecls = List1.concatMap1 deepUnscopeDecl
+    -- Want to use foldMap1 here, but it requires base >= 4.18 (GHC 9.6)
+
+deepUnscopeDecl :: A.Declaration -> List1 A.Declaration
 deepUnscopeDecl = \case
-  A.ScopedDecl _ ds           -> deepUnscopeDecls ds
-  A.Mutual i ds               -> [A.Mutual i (deepUnscopeDecls ds)]
-  A.Section i e m tel ds      -> [A.Section i e m (deepUnscope tel)
-                                   (deepUnscopeDecls ds)]
-  A.RecDef i x uc dir bs e ds -> [ A.RecDef i x uc dir (deepUnscope bs)
-                                     (deepUnscope e)
-                                     (deepUnscopeDecls ds) ]
-  d                           -> [deepUnscope d]
+  A.ScopedDecl _ ds ->
+    deepUnscopeDecls ds
+
+  A.Mutual i ds -> singleton $
+    A.Mutual i (deepUnscopeDecls ds)
+
+  A.Section i e m tel ds -> singleton $
+    A.Section i e m (deepUnscope tel) (deepUnscopeDecls ds)
+
+  A.RecDef i x pc uc eta dir bs e ds -> singleton $
+    A.RecDef i x pc uc eta dir (deepUnscope bs) (deepUnscope e) (deepUnscopeDecls ds)
+
+  d -> singleton $ deepUnscope d
 
 -- * Traversal
 ---------------------------------------------------------------------------
@@ -129,7 +151,7 @@ type RecurseExprRecFn m = forall a. ExprLike a => a -> m a
 type FoldExprFn m a = Monoid m => (Expr -> m) -> a -> m
 type FoldExprRecFn m = forall a. ExprLike a => a -> m
 
-type TraverseExprFn m a = (Applicative m, Monad m) => (Expr -> m Expr) -> a -> m a
+type TraverseExprFn m a = (Monad m) => (Expr -> m Expr) -> a -> m a
 type TraverseExprRecFn m = forall a. ExprLike a => a -> m a
 
 -- | Apply an expression rewriting to every subexpression, inside-out.
@@ -174,8 +196,10 @@ instance ExprLike Expr where
       Generalized  s e           -> Generalized s <$> recurse e
       Fun ei arg e               -> Fun ei <$> recurse arg <*> recurse e
       Let ei bs e                -> Let ei <$> recurse bs <*> recurse e
-      Rec ei bs                  -> Rec ei <$> recurse bs
-      RecUpdate ei e bs          -> RecUpdate ei <$> recurse e <*> recurse bs
+      Rec kwr ei bs              -> Rec kwr ei <$> recurse bs
+      RecUpdate kwr ei e bs      -> RecUpdate kwr ei <$> recurse e <*> recurse bs
+      RecWhere kwr ei bs e       -> RecWhere kwr ei <$> recurse bs <*> recurse e
+      RecUpdateWhere k r e ds fs -> RecUpdateWhere k r <$> recurse e <*> recurse ds <*> recurse fs
       ScopedExpr sc e            -> ScopedExpr sc <$> recurse e
       Quote{}                    -> pure e0
       QuoteTerm{}                -> pure e0
@@ -183,36 +207,42 @@ instance ExprLike Expr where
       DontCare e                 -> DontCare <$> recurse e
       PatternSyn{}               -> pure e0
       Macro{}                    -> pure e0
+      Qualified q e              -> Qualified q <$> recurse e
+      Highlighted q e            -> Highlighted q <$> recurse e
 
   foldExpr :: forall m. FoldExprFn m Expr
   foldExpr f e =
     case e of
-      Var{}                  -> m
-      Def'{}                 -> m
-      Proj{}                 -> m
-      Con{}                  -> m
-      PatternSyn{}           -> m
-      Macro{}                -> m
-      Lit{}                  -> m
-      QuestionMark{}         -> m
-      Underscore{}           -> m
-      Dot _ e                -> m `mappend` fold e
-      App _ e e'             -> m `mappend` fold e `mappend` fold e'
-      WithApp _ e es         -> m `mappend` fold e `mappend` fold es
-      Lam _ b e              -> m `mappend` fold b `mappend` fold e
-      AbsurdLam{}            -> m
-      ExtendedLam _ _ _ _ cs -> m `mappend` fold cs
-      Pi _ tel e             -> m `mappend` fold tel `mappend` fold e
-      Generalized _ e        -> m `mappend` fold e
-      Fun _ e e'             -> m `mappend` fold e `mappend` fold e'
-      Let _ bs e             -> m `mappend` fold bs `mappend` fold e
-      Rec _ as               -> m `mappend` fold as
-      RecUpdate _ e as       -> m `mappend` fold e `mappend` fold as
-      ScopedExpr _ e         -> m `mappend` fold e
-      Quote{}                -> m
-      QuoteTerm{}            -> m
-      Unquote{}              -> m
-      DontCare e             -> m `mappend` fold e
+      Var{}                    -> m
+      Def'{}                   -> m
+      Proj{}                   -> m
+      Con{}                    -> m
+      PatternSyn{}             -> m
+      Macro{}                  -> m
+      Lit{}                    -> m
+      QuestionMark{}           -> m
+      Underscore{}             -> m
+      Dot _ e                  -> m `mappend` fold e
+      App _ e e'               -> m `mappend` fold e `mappend` fold e'
+      WithApp _ e es           -> m `mappend` fold e `mappend` fold es
+      Lam _ b e                -> m `mappend` fold b `mappend` fold e
+      AbsurdLam{}              -> m
+      ExtendedLam _ _ _ _ cs   -> m `mappend` fold cs
+      Pi _ tel e               -> m `mappend` fold tel `mappend` fold e
+      Generalized _ e          -> m `mappend` fold e
+      Fun _ e e'               -> m `mappend` fold e `mappend` fold e'
+      Let _ bs e               -> m `mappend` fold bs `mappend` fold e
+      Rec _ _ as               -> m `mappend` fold as
+      RecUpdate _ _ e as       -> m `mappend` fold e `mappend` fold as
+      RecWhere _ _ e as        -> m `mappend` fold e `mappend` fold as
+      RecUpdateWhere _ _ e x y -> m `mappend` fold e `mappend` fold x `mappend` fold y
+      ScopedExpr _ e           -> m `mappend` fold e
+      Quote{}                  -> m
+      QuoteTerm{}              -> m
+      Unquote{}                -> m
+      DontCare e               -> m `mappend` fold e
+      Qualified _ e            -> m `mappend` fold e
+      Highlighted _ e          -> m `mappend` fold e
    where
      m = f e
      fold :: FoldExprRecFn m
@@ -241,8 +271,10 @@ instance ExprLike Expr where
       Generalized s e            -> f =<< Generalized s <$> trav e
       Fun ei arg e               -> f =<< Fun ei <$> trav arg <*> trav e
       Let ei bs e                -> f =<< Let ei <$> trav bs <*> trav e
-      Rec ei bs                  -> f =<< Rec ei <$> trav bs
-      RecUpdate ei e bs          -> f =<< RecUpdate ei <$> trav e <*> trav bs
+      Rec kwr ei bs              -> f =<< Rec kwr ei <$> trav bs
+      RecUpdate kwr ei e bs      -> f =<< RecUpdate kwr ei <$> trav e <*> trav bs
+      RecWhere kwr ei e bs       -> f =<< RecWhere kwr ei <$> trav e <*> trav bs
+      RecUpdateWhere k r ei e bs -> f =<< RecUpdateWhere k r ei <$> trav e <*> trav bs
       ScopedExpr sc e            -> f =<< ScopedExpr sc <$> trav e
       Quote{}                    -> f e
       QuoteTerm{}                -> f e
@@ -250,12 +282,16 @@ instance ExprLike Expr where
       DontCare e                 -> f =<< DontCare <$> trav e
       PatternSyn{}               -> f e
       Macro{}                    -> f e
+      Qualified m e              -> f =<< Qualified m <$> trav e
+      Highlighted q e            -> f =<< Highlighted q <$> trav e
 
 instance ExprLike a => ExprLike (Arg a)
 instance ExprLike a => ExprLike (Maybe a)
 instance ExprLike a => ExprLike (Named x a)
+instance ExprLike a => ExprLike (Ranged a)
 instance ExprLike a => ExprLike [a]
 instance ExprLike a => ExprLike (List1 a)
+instance ExprLike a => ExprLike (TacticAttribute' a)
 
 instance (ExprLike a, ExprLike b) => ExprLike (a, b) where
   recurseExpr f (x, y) = (,) <$> recurseExpr f x <*> recurseExpr f y
@@ -330,19 +366,19 @@ instance ExprLike LetBinding where
       recurse e = recurseExpr f e
     case e of
       LetBind li ai x e e'  -> LetBind li ai x <$> recurse e <*> recurse e'
-      LetPatBind li p e     -> LetPatBind li <$> recurse p <*> recurse e
+      LetAxiom li ai x e    -> LetAxiom li ai x <$> recurse e
+      LetPatBind li ai p e  -> LetPatBind li ai <$> recurse p <*> recurse e
       LetApply{}            -> pure e
       LetOpen{}             -> pure e
-      LetDeclaredVariable _ -> pure e
 
   foldExpr :: forall m. FoldExprFn m LetBinding
   foldExpr f e =
     case e of
       LetBind _ _ _ e e'    -> fold e `mappend` fold e'
-      LetPatBind _ p e      -> fold p `mappend` fold e
+      LetAxiom _ _ _ e      -> fold e
+      LetPatBind _ _ p e    -> fold p `mappend` fold e
       LetApply{}            -> mempty
       LetOpen{}             -> mempty
-      LetDeclaredVariable _ -> mempty
     where
       fold :: FoldExprRecFn m
       fold e = foldExpr f e
@@ -354,10 +390,10 @@ instance ExprLike LetBinding where
       trav e = traverseExpr f e
     case e of
       LetBind li ai x e e'  -> LetBind li ai x <$> trav e <*> trav e'
-      LetPatBind li p e     -> LetPatBind li <$> trav p <*> trav e
+      LetAxiom li ai x e    -> LetAxiom li ai x <$> trav e
+      LetPatBind li ai p e  -> LetPatBind li ai <$> trav p <*> trav e
       LetApply{}            -> pure e
       LetOpen{}             -> pure e
-      LetDeclaredVariable _ -> pure e
 
 instance ExprLike a => ExprLike (Pattern' a) where
 
@@ -380,10 +416,11 @@ instance ExprLike RHS where
       rec :: RecurseExprRecFn m
       rec e = recurseExpr f e
 
-instance (ExprLike qn, ExprLike nm, ExprLike p, ExprLike e) => ExprLike (RewriteEqn' qn nm p e) where
+instance (ExprLike qn, ExprLike p, ExprLike e) => ExprLike (RewriteEqn' qn nm p e) where
   recurseExpr f = \case
     Rewrite es    -> Rewrite <$> recurseExpr f es
     Invert qn pes -> Invert <$> recurseExpr f qn <*> recurseExpr f pes
+    LeftLet pes   -> LeftLet <$> recurseExpr f pes
 
 instance ExprLike WhereDeclarations where
   recurseExpr f (WhereDecls a b c) = WhereDecls a b <$> recurseExpr f c
@@ -409,9 +446,10 @@ instance ExprLike Pragma where
       CompilePragma{}             -> pure p
       StaticPragma{}              -> pure p
       InjectivePragma{}           -> pure p
+      InjectiveForInferencePragma{} -> pure p
       InlinePragma{}              -> pure p
-      EtaPragma{}                 -> pure p
       NotProjectionLikePragma{}   -> pure p
+      OverlapPragma{}             -> pure p
       DisplayPragma f xs e        -> DisplayPragma f <$> rec xs <*> rec e
     where
       rec :: RecurseExprRecFn m
@@ -442,9 +480,9 @@ instance ExprLike Declaration where
       Open{}                    -> pure d
       FunDef i f cs             -> FunDef i f <$> rec cs
       DataSig i er d tel e      -> DataSig i er d <$> rec tel <*> rec e
-      DataDef i d uc bs cs      -> DataDef i d uc <$> rec bs <*> rec cs
+      DataDef i d pc uc bs cs   -> DataDef i d pc uc <$> rec bs <*> rec cs
       RecSig i er r tel e       -> RecSig i er r <$> rec tel <*> rec e
-      RecDef i r uc dir bs e ds -> RecDef i r uc dir <$> rec bs <*> rec e <*> rec ds
+      RecDef i r pc uc eta dir bs e ds -> RecDef i r pc uc eta dir <$> rec bs <*> rec e <*> rec ds
       PatternSynDef f xs p      -> PatternSynDef f xs <$> rec p
       UnquoteDecl i is xs e     -> UnquoteDecl i is xs <$> rec e
       UnquoteDef i xs e         -> UnquoteDef i xs <$> rec e
@@ -492,7 +530,9 @@ instance DeclaredNames KName where
 
 instance DeclaredNames RecordDirectives where
   declaredNames (RecordDirectives i _ _ c) = kc where
-    kc = maybe mempty (singleton . WithKind k) c
+    kc = case c of
+      NamedRecCon c -> singleton $ WithKind k c
+      FreshRecCon{} -> mempty
     k  = maybe ConName (conKindOfName . rangedThing) i
 
 instance DeclaredNames Declaration where
@@ -506,13 +546,13 @@ instance DeclaredNames Declaration where
       Primitive _ q _              -> singleton (WithKind PrimName q)
       Mutual _ decls               -> declaredNames decls
       DataSig _ _ q _ _            -> singleton (WithKind DataName q)
-      DataDef _ q _ _ decls        -> singleton (WithKind DataName q) <> foldMap con decls
+      DataDef _ q _ _ _ decls      -> singleton (WithKind DataName q) <> foldMap con decls
       RecSig _ _ q _ _             -> singleton (WithKind RecName q)
-      RecDef _ q _ dir _ _ decls   -> singleton (WithKind RecName q) <> declaredNames dir <> declaredNames decls
+      RecDef _ q _ _ _ dir _ _ decls -> singleton (WithKind RecName q) <> declaredNames dir <> declaredNames decls
       PatternSynDef q _ _          -> singleton (WithKind PatternSynName q)
       UnquoteDecl _ _ qs _         -> fromList $ map (WithKind OtherDefName) qs  -- could be Fun or Axiom
       UnquoteDef _ qs _            -> fromList $ map (WithKind FunName) qs       -- cannot be Axiom
-      UnquoteData _ d _ _ cs _     -> singleton (WithKind DataName d) <> (fromList $ map (WithKind ConName) cs) -- singleton _ <> map (WithKind ConName) cs
+      UnquoteData _ d _ _ cs _     -> singleton (WithKind DataName d) <> fromList (map (WithKind ConName) cs) -- singleton _ <> map (WithKind ConName) cs
       FunDef _ q cls               -> singleton (WithKind FunName q) <> declaredNames cls
       ScopedDecl _ decls           -> declaredNames decls
       Section _ _ _ _ decls        -> declaredNames decls
@@ -533,12 +573,13 @@ instance DeclaredNames Pragma where
     CompilePragma{}           -> mempty
     RewritePragma{}           -> mempty
     StaticPragma{}            -> mempty
-    EtaPragma{}               -> mempty
     InjectivePragma{}         -> mempty
+    InjectiveForInferencePragma{} -> mempty
     InlinePragma{}            -> mempty
     NotProjectionLikePragma{} -> mempty
     DisplayPragma{}           -> mempty
     OptionsPragma{}           -> mempty
+    OverlapPragma{}           -> mempty
 
 instance DeclaredNames Clause where
   declaredNames (Clause _ _ rhs decls _) = declaredNames rhs <> declaredNames decls
@@ -623,7 +664,6 @@ instance DeclaredNames RHS where
 --   declaredNames (LetPatBind _ _ e)      = declaredNames e
 --   declaredNames (LetApply _ _ app _ _)  = declaredNames app
 --   declaredNames LetOpen{}               = mempty
---   declaredNames (LetDeclaredVariable _) = mempty
 
 -- instance DeclaredNames ModuleApplication where
 --   declaredNames (SectionApp bindss _ es) = declaredNames bindss <> declaredNames es

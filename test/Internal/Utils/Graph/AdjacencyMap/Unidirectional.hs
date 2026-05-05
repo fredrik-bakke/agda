@@ -2,39 +2,42 @@
 
 -- | Properties for graph library.
 
-module Internal.Utils.Graph.AdjacencyMap.Unidirectional ( tests ) where
+module Internal.Utils.Graph.AdjacencyMap.Unidirectional ( tests, nodeIn ) where
 
-import Agda.TypeChecking.Positivity.Occurrence
+import Prelude hiding (null)
+
+import Control.Monad
+
+import Data.Bifunctor
+import Data.Foldable qualified as Fold
+import Data.Function (on)
+import Data.Graph qualified as Graph
+import Data.List qualified as List
+import Data.Maybe
+import Data.Map (Map)
+import Data.Map qualified as Map
+import Data.Set (Set)
+import Data.Set qualified as Set
+
+import Agda.Syntax.Common.Pretty
+import Agda.TypeChecking.Positivity.Occurrence (Occurrence(..))
+import Agda.TypeChecking.Positivity.Warnings (boundToEverySome, productOfEdgesInBoundedWalk)
 
 import Agda.Utils.Function (iterateUntil)
 import Agda.Utils.Functor
 import Agda.Utils.Graph.AdjacencyMap.Unidirectional as Graph
-import Agda.Utils.List (distinct, nubOn)
+import Agda.Utils.List (distinct, headWithDefault, nubOn)
 import Agda.Utils.Null as Null
 import Agda.Utils.SemiRing
 import Agda.Utils.Singleton (Singleton)
-import qualified Agda.Utils.Singleton as Singleton
+import Agda.Utils.Singleton qualified as Singleton
+
 import Agda.Utils.Impossible
-import Agda.Syntax.Common.Pretty
-
-import Control.Monad
-
-import qualified Data.Foldable as Fold
-import Data.Function (on)
-import qualified Data.Graph as Graph
-import qualified Data.List as List
-import Data.Maybe
-import Data.Map (Map)
-import qualified Data.Map as Map
-import Data.Set (Set)
-import qualified Data.Set as Set
 
 import Internal.Helpers
 import Internal.TypeChecking.Positivity.Occurrence ()
 
-import Prelude hiding (null)
-
-import Test.QuickCheck as QuickCheck
+import qualified Test.QuickCheck as QuickCheck
 
 
 ------------------------------------------------------------------------
@@ -119,7 +122,7 @@ prop_acyclicGraph =
 
 -- | Generates a node from the graph. (Unless the graph is empty.)
 
-nodeIn :: (Ord n, Arbitrary n) => Graph n e -> Gen n
+nodeIn :: (Arbitrary n) => Graph n e -> Gen n
 nodeIn g = elementsUnlessEmpty (Set.toList $ nodes g)
 
 -- | Generates an edge from the graph. (Unless the graph contains no
@@ -243,7 +246,7 @@ prop_invariant_insertEdgeWith ::
 prop_invariant_insertEdgeWith f e = invariant . insertEdgeWith f e
 
 prop_invariant_union :: G -> G -> Bool
-prop_invariant_union g1 g2 = invariant (union g1 g2)
+prop_invariant_union g1 g2 = invariant (g1 `union` g2)
 
 prop_invariant_unionWith :: (E -> E -> E) -> G -> G -> Bool
 prop_invariant_unionWith f g1 g2 = invariant (unionWith f g1 g2)
@@ -255,7 +258,10 @@ prop_invariant_unionsWith :: (E -> E -> E) -> [G] -> Bool
 prop_invariant_unionsWith f = invariant . unionsWith f
 
 prop_invariant_mapWithEdge :: (Edge N E -> E) -> G -> Bool
-prop_invariant_mapWithEdge f= invariant . mapWithEdge f
+prop_invariant_mapWithEdge f = invariant . mapWithEdge f
+
+prop_invariant_mapLoops :: (E -> E) -> G -> Bool
+prop_invariant_mapLoops f = invariant . mapLoops f
 
 prop_invariant_transpose :: G -> Bool
 prop_invariant_transpose = invariant . transpose
@@ -410,6 +416,9 @@ prop_insertWith :: (E -> E -> E) -> N -> N -> E -> G -> Bool
 prop_insertWith f s t e g =
   insertWith f s t e g == unionWith (flip f) g (singleton s t e)
 
+prop_mapLoops :: (E -> E) -> G -> Bool
+prop_mapLoops f g = loops (mapLoops f g) == map (second f) (loops g)
+
 prop_transpose :: G -> Bool
 prop_transpose g = transpose (transpose g) == g
 
@@ -431,7 +440,7 @@ prop_removeEdge g =
     .&&.
   (not (null (nodes g)) ==>
    forAll (vectorOf 2 (nodeIn g)) $ \[s, t] ->
-   not (t `elem` map target (edgesFrom g [s])) ==>
+   t `notElem` (map target (edgesFrom g [s])) ==>
    forAll arbitrary $ \l ->
      removeEdge s t (insertEdge (Edge s t l) g) == g)
 
@@ -512,10 +521,11 @@ prop_sccs' g =
     ]
     where
     component k =
-      head [ i
-           | (i, ns) <- zip [1..] (reverse components)
-           , k `elem` ns
-           ]
+      headWithDefault __IMPOSSIBLE__
+        [ i
+        | (i, ns) <- zip [1..] (reverse components)
+        , k `elem` ns
+        ]
 
 prop_oppositeDAG :: G -> Bool
 prop_oppositeDAG g =
@@ -604,7 +614,7 @@ prop_longestPaths1 =
     (all (\(n, ps) -> all ((== n) . length) ps) $
      map Graph.label (edges g'))
     .&&.
-  (forAll (nodeIn g) $ \n ->
+  forAll (nodeIn g) (\n ->
    Map.keysSet (reachableFrom g n)
      ==
    Map.keysSet (neighboursMap n g'))
@@ -746,7 +756,7 @@ g2 = Graph $ Map.fromList
 
 g3 = Graph $ Map.fromList
   [ (n 1, Map.fromList [(n 2,StrictPos)])
-  , (n 2, Map.fromList [])
+  , (n 2, Map.empty)
   , (n 4, Map.fromList [(n 1,StrictPos)])
   ]
 

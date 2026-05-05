@@ -1,3 +1,7 @@
-Issue998.agda:9,12-15
-a != Issue998.a of type A
+Issue998.agda:9.12-15: error: [UnequalTerms]
+The terms
+  a
+and
+  Issue998.a
+are not equal at type A
 when checking that the expression d a has type D Issue998.a

@@ -1,17 +1,22 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
 
 ------------------------------------------------------------------------
 -- Top-level module names
 ------------------------------------------------------------------------
 
-module Agda.Syntax.TopLevelModuleName where
+module Agda.Syntax.TopLevelModuleName
+  ( module Agda.Syntax.TopLevelModuleName
+  , module Agda.Syntax.TopLevelModuleName.Boot
+  ) where
+
+import Agda.Syntax.TopLevelModuleName.Boot
+import Agda.Syntax.Abstract.Name (isNoName)
 
 import Control.DeepSeq
 
 import Data.Function (on)
-import Data.Hashable
 import qualified Data.List as List
-import Data.Text (Text)
 import qualified Data.Text as T
 
 import GHC.Generics (Generic)
@@ -19,16 +24,14 @@ import GHC.Generics (Generic)
 import System.FilePath
 
 import qualified Agda.Syntax.Abstract.Name as A
-import Agda.Syntax.Common
 import qualified Agda.Syntax.Concrete as C
 import Agda.Syntax.Position
 
-import Agda.Utils.BiMap (HasTag(..))
 import Agda.Utils.FileName
+import Agda.Utils.Function (iterate')
 import Agda.Utils.Hash
 import Agda.Utils.Impossible
 import Agda.Utils.Lens
-import Agda.Utils.List1 (List1)
 import qualified Agda.Utils.List1 as List1
 import Agda.Syntax.Common.Pretty
 import Agda.Utils.Singleton
@@ -37,15 +40,14 @@ import Agda.Utils.Size
 ------------------------------------------------------------------------
 -- Raw top-level module names
 
--- | A top-level module name has one or more name parts.
-
-type TopLevelModuleNameParts = List1 Text
-
 -- | Raw top-level module names (with linear-time comparisons).
 
 data RawTopLevelModuleName = RawTopLevelModuleName
   { rawModuleNameRange :: Range
   , rawModuleNameParts :: TopLevelModuleNameParts
+  , rawModuleNameInferred :: !Bool
+      -- ^ Was this module name constructed from a file name
+      --   rather than declared in the file?
   }
   deriving (Show, Generic)
 
@@ -66,11 +68,11 @@ instance HasRange RawTopLevelModuleName where
   getRange = rawModuleNameRange
 
 instance SetRange RawTopLevelModuleName where
-  setRange r (RawTopLevelModuleName _ x) = RawTopLevelModuleName r x
+  setRange r (RawTopLevelModuleName _ x z) = RawTopLevelModuleName r x z
 
 instance KillRange RawTopLevelModuleName where
-  killRange (RawTopLevelModuleName _ x) =
-    RawTopLevelModuleName noRange x
+  killRange (RawTopLevelModuleName _ x z) =
+    RawTopLevelModuleName noRange x z
 
 instance C.IsNoName RawTopLevelModuleName where
   isNoName m = rawModuleNameParts m == singleton "_"
@@ -78,7 +80,7 @@ instance C.IsNoName RawTopLevelModuleName where
 -- | The 'Range' is not forced.
 
 instance NFData RawTopLevelModuleName where
-  rnf (RawTopLevelModuleName _ x) = rnf x
+  rnf (RawTopLevelModuleName _ x _) = rnf x
 
 -- | Turns a raw top-level module name into a string.
 
@@ -101,6 +103,7 @@ rawTopLevelModuleNameForQName q = RawTopLevelModuleName
   { rawModuleNameRange = getRange q
   , rawModuleNameParts =
       fmap (T.pack . C.nameToRawName) $ C.qnameParts q
+  , rawModuleNameInferred = C.isNoName q
   }
 
 -- | Computes the 'RawTopLevelModuleName' corresponding to the given
@@ -110,53 +113,26 @@ rawTopLevelModuleNameForQName q = RawTopLevelModuleName
 
 rawTopLevelModuleNameForModuleName ::
   A.ModuleName -> RawTopLevelModuleName
-rawTopLevelModuleNameForModuleName (A.MName []) = __IMPOSSIBLE__
-rawTopLevelModuleNameForModuleName (A.MName ms) =
+rawTopLevelModuleNameForModuleName x@(A.MName ms) =
   List1.ifNull ms __IMPOSSIBLE__ $ \ms ->
   RawTopLevelModuleName
     { rawModuleNameRange = getRange ms
     , rawModuleNameParts =
         fmap (T.pack . C.nameToRawName . A.nameConcrete) ms
+    , rawModuleNameInferred = isNoName x
     }
 
--- | Computes the top-level module name.
---
--- Precondition: The 'C.Module' has to be well-formed.
--- This means that there are only allowed declarations before the
--- first module declaration, typically import declarations.
--- See 'spanAllowedBeforeModule'.
+-- | Retrieves the top-level module name.
 
 rawTopLevelModuleNameForModule :: C.Module -> RawTopLevelModuleName
-rawTopLevelModuleNameForModule (C.Mod _ []) = __IMPOSSIBLE__
-rawTopLevelModuleNameForModule (C.Mod _ ds) =
-  case C.spanAllowedBeforeModule ds of
-    (_, C.Module _ _ n _ _ : _) -> rawTopLevelModuleNameForQName n
-    _                           -> __IMPOSSIBLE__
+rawTopLevelModuleNameForModule (C.Mod n _pragmas _decls) = rawTopLevelModuleNameForQName n
 
 ------------------------------------------------------------------------
 -- Top-level module names
 
 -- | Top-level module names (with constant-time comparisons).
 
-data TopLevelModuleName = TopLevelModuleName
-  { moduleNameRange :: Range
-  , moduleNameId    :: {-# UNPACK #-} !ModuleNameHash
-  , moduleNameParts :: TopLevelModuleNameParts
-  }
-  deriving (Show, Generic)
-
-instance HasTag TopLevelModuleName where
-  type Tag TopLevelModuleName = ModuleNameHash
-  tag = Just . moduleNameId
-
-instance Eq TopLevelModuleName where
-  (==) = (==) `on` moduleNameId
-
-instance Ord TopLevelModuleName where
-  compare = compare `on` moduleNameId
-
-instance Hashable TopLevelModuleName where
-  hashWithSalt salt = hashWithSalt salt . moduleNameId
+type TopLevelModuleName = TopLevelModuleName' Range
 
 instance Sized TopLevelModuleName where
   size = size . rawTopLevelModuleName
@@ -164,20 +140,6 @@ instance Sized TopLevelModuleName where
 
 instance Pretty TopLevelModuleName where
   pretty = pretty . rawTopLevelModuleName
-
-instance HasRange TopLevelModuleName where
-  getRange = moduleNameRange
-
-instance SetRange TopLevelModuleName where
-  setRange r (TopLevelModuleName _ h x) = TopLevelModuleName r h x
-
-instance KillRange TopLevelModuleName where
-  killRange (TopLevelModuleName _ h x) = TopLevelModuleName noRange h x
-
--- | The 'Range' is not forced.
-
-instance NFData TopLevelModuleName where
-  rnf (TopLevelModuleName _ x y) = rnf (x, y)
 
 -- | A lens focusing on the 'moduleNameParts'.
 
@@ -192,6 +154,7 @@ rawTopLevelModuleName :: TopLevelModuleName -> RawTopLevelModuleName
 rawTopLevelModuleName m = RawTopLevelModuleName
   { rawModuleNameRange = moduleNameRange m
   , rawModuleNameParts = moduleNameParts m
+  , rawModuleNameInferred = moduleNameInferred m
   }
 
 -- | Converts a raw top-level module name and a hash to a top-level
@@ -207,6 +170,7 @@ unsafeTopLevelModuleName m h = TopLevelModuleName
   { moduleNameRange = rawModuleNameRange m
   , moduleNameParts = rawModuleNameParts m
   , moduleNameId    = h
+  , moduleNameInferred = rawModuleNameInferred m
   }
 
 -- | A corresponding 'C.QName'. The range of each 'Name' part is the
@@ -237,5 +201,4 @@ moduleNameToFileName TopLevelModuleName{ moduleNameParts = ms } ext =
 
 projectRoot :: AbsolutePath -> TopLevelModuleName -> AbsolutePath
 projectRoot file TopLevelModuleName{ moduleNameParts = m } =
-  mkAbsolute $
-    iterate takeDirectory (filePath file) !! length m
+  mkAbsolute $ iterate' (length m) takeDirectory $ filePath file

@@ -17,59 +17,59 @@ jobs:
       && !contains(github.event.head_commit.message, '[skip github]')
     runs-on: ubuntu-latest
     steps:
-    - uses: styfle/cancel-workflow-action@0.11.0
+    - uses: styfle/cancel-workflow-action@0.13.1
       with:
         access_token: ${{ github.token }}
   cabal-install:
     env:
       FLAGS: -O0 -f enable-cluster-counting
+    name: cabal install ${{ matrix.name }}
     needs: auto-cancel
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
     - id: setup-haskell
-      uses: haskell/actions/setup@v2
+      uses: haskell-actions/setup@v2
       with:
-        cabal-version: ${{ matrix.cabal-ver }}
-        ghc-version: ${{ matrix.ghc-ver }}
-    - name: Environment settings based on the Haskell setup
-      run: |
-        export GHC_VER=$(ghc --numeric-version)
-        export CABAL_VER=$(cabal --numeric-version)
-        echo "GHC_VER   = ${GHC_VER}"
-        echo "CABAL_VER = ${CABAL_VER}"
-        echo "GHC_VER=${GHC_VER}"       >> ${GITHUB_ENV}
-        echo "CABAL_VER=${CABAL_VER}"   >> ${GITHUB_ENV}
+        cabal-update: true
+        cabal-version: latest
+        ghc-version: 9.14.1
     - name: Configure the build plan
       run: |
-        cabal update
+        # shellcheck disable=SC2086
         cabal configure ${FLAGS}
         cabal build --dry-run
-    - id: cache
-      name: Cache dependencies
-      uses: actions/cache@v3
+    - env:
+        key: cabal-install.yml-${{ runner.os }}-ghc-${{ steps.setup-haskell.outputs.ghc-version
+          }}-cabal-${{ steps.setup-haskell.outputs.cabal-version }}
+      id: cache
+      name: Restore cached dependencies
+      uses: actions/cache/restore@v5
       with:
-        key: cabal-install.yml-${{ runner.os }}-ghc-${{ env.GHC_VER }}-cabal-${{ env.CABAL_VER
-          }}-${{ hashFiles('**/plan.json') }}
-        path: ~/.cabal/store
-        restore-keys: cabal-install.yml-${{ runner.os }}-ghc-${{ env.GHC_VER }}-cabal-${{
-          env.CABAL_VER }}-
-    - if: ${{ !steps.cache.outputs.cache-hit }}
-      name: Install dependencies
+        key: ${{ env.key }}-${{ hashFiles('**/plan.json') }}
+        path: ${{ steps.setup-haskell.outputs.cabal-store }}
+        restore-keys: ${{ env.key }}-
+    - name: Install dependencies
       run: |
         cabal build --only-dependencies
     - name: Install Agda
       run: |
-        cabal install ${FLAGS}
+        # shellcheck disable=SC2086
+        cabal install ${FLAGS} ${{ matrix.install_flags }}
+    - if: always() && steps.cache.outputs.cache-hit != 'true'
+      name: Save cache
+      uses: actions/cache/save@v5
+      with:
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+        path: ${{ steps.setup-haskell.outputs.cabal-store }}
     strategy:
       fail-fast: false
       matrix:
-        cabal-ver:
-        - 3.10.1.0
-        ghc-ver:
-        - 9.6.2
-        os:
-        - ubuntu-latest
+        include:
+        - install_flags: ''
+          name: ''
+        - install_flags: --lib
+          name: --lib
     timeout-minutes: 60
 name: Install (v2-cabal)
 'on':
@@ -77,7 +77,6 @@ name: Install (v2-cabal)
     paths:
     - .github/workflows/cabal-install.yml
     - Agda.cabal
-    - Setup.hs
     - src/full/**
     - src/main/**
   push:
@@ -88,6 +87,5 @@ name: Install (v2-cabal)
     paths:
     - .github/workflows/cabal-install.yml
     - Agda.cabal
-    - Setup.hs
     - src/full/**
     - src/main/**

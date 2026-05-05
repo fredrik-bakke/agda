@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 {-# OPTIONS_GHC -Wunused-imports #-}
 
 {-| This module contains the building blocks used to construct the lexer.
@@ -15,7 +17,7 @@ module Agda.Syntax.Parser.LexActions
     , begin_, end_
     , lexError
       -- ** Specialized actions
-    , keyword, symbol, identifier, literal, literal', integer
+    , keyword, symbol, qualifiedToken, literal, literal', integer
       -- * Lex predicates
     , followedBy, eof, inState
     ) where
@@ -24,7 +26,9 @@ import Control.Monad.State (modify)
 
 import Data.Bifunctor
 import Data.Char
+#if !MIN_VERSION_base(4,20,0)
 import Data.Foldable (foldl')
+#endif
 import Data.Maybe
 
 import Agda.Syntax.Common (pattern Ranged)
@@ -98,10 +102,10 @@ postToken :: Token -> Token
 postToken (TokId (r, "\x03bb")) = TokSymbol SymLambda r
 postToken (TokId (r, "\x2026")) = TokSymbol SymEllipsis r
 postToken (TokId (r, "\x2192")) = TokSymbol SymArrow r
-postToken (TokId (r, "\x2983")) = TokSymbol SymDoubleOpenBrace r
-postToken (TokId (r, "\x2984")) = TokSymbol SymDoubleCloseBrace r
-postToken (TokId (r, "\x2987")) = TokSymbol SymOpenIdiomBracket r
-postToken (TokId (r, "\x2988")) = TokSymbol SymCloseIdiomBracket r
+postToken (TokId (r, "\x2983")) = TokSymbol (SymDoubleOpenBrace True) r
+postToken (TokId (r, "\x2984")) = TokSymbol (SymDoubleCloseBrace True) r
+postToken (TokId (r, "\x2987")) = TokSymbol (SymOpenIdiomBracket True) r
+postToken (TokId (r, "\x2988")) = TokSymbol (SymCloseIdiomBracket True) r
 postToken (TokId (r, "\x2987\x2988")) = TokSymbol SymEmptyIdiomBracket r
 postToken (TokId (r, "\x2200")) = TokKeyword KwForall r
 postToken t = t
@@ -133,13 +137,16 @@ withInterval' f t = withInterval (t . second f)
 withInterval_ :: (Interval -> r) -> LexAction r
 withInterval_ f = withInterval (f . fst)
 
+-- | Enter the layout state for the given keyword.
+enterLayout :: Keyword -> Parser ()
+enterLayout kw = do
+  pushLexState layout
+  modify \st -> st { parseLayKw = kw }
 
 -- | Executed for layout keywords. Enters the 'Agda.Syntax.Parser.Lexer.layout'
 --   state and performs the given action.
 withLayout :: Keyword -> LexAction r -> LexAction r
-withLayout kw a = pushLexState layout `andThen` setLayoutKw `andThen` a
-  where
-  setLayoutKw = modify $ \ st -> st { parseLayKw = kw }
+withLayout kw a = enterLayout kw `andThen` a
 
 infixr 1 `andThen`
 
@@ -251,21 +258,40 @@ literal' read lit = withInterval' read $ \ (r, a) ->
 literal :: Read a => (a -> Literal) -> LexAction Token
 literal = literal' read
 
--- | Parse an identifier. Identifiers can be qualified (see 'Name').
---   Example: @Foo.Bar.f@
-identifier :: LexAction Token
-identifier = qualified $ either (TokId . second toList) (TokQId . map (second toList))
+-- | Parse a potentially-qualified token. This action is responsible for
+-- lexing both identifiers (which do not always have a qualifier, in
+-- which case a 'TokId' is returned) *and* "qualified keywords", like
+-- qualified @do@.
+--
+-- This action may thus modify the layout state of the parser, since
+-- qualified @do@ is a layout "keyword".
+--
+-- Examples: @Foo.Bar.f@, @Foo.do@.
+qualifiedToken :: LexAction Token
+qualifiedToken = qualified $ either (pure . TokId . second toList) (qid . map (second toList)) where
+  qid :: [(Interval, String)] -> Parser Token
+  qid parts = case initLast parts of
+    -- For qualified 'do', we have to pretend to be a layout keyword
+    Just (initp, (i, "do")) ->
+      TokQual QualDo initp i <$ enterLayout KwDo
 
+    Just (initp, (i, "(|)"))          -> pure $ TokQual QualEmptyIdiom initp i
+    Just (initp, (i, "\x2987\x2988")) -> pure $ TokQual QualEmptyIdiom initp i
+
+    Just (initp, (i, "(|"))           -> pure $ TokQual (QualOpenIdiom False) initp i
+    Just (initp, (i, "\x2987"))       -> pure $ TokQual (QualOpenIdiom True) initp i
+
+    _                                 -> pure $ TokQId parts
 
 -- | Parse a possibly qualified name.
-qualified :: (Either (Interval, String1) [(Interval, String1)] -> a) -> LexAction a
+qualified :: (Either (Interval, String1) [(Interval, String1)] -> Parser a) -> LexAction a
 qualified tok =
     token $ \s ->
     do  i <- getParseInterval
         case mkName i $ List1.wordsBy (== '.') s of
             []  -> lexError "lex error on .."
-            [x] -> return $ tok $ Left  x
-            xs  -> return $ tok $ Right xs
+            [x] -> tok $ Left  x
+            xs  -> tok $ Right xs
     where
         -- Compute the ranges for the substrings (separated by '.') of
         -- a name. Dots are included: the intervals generated for
@@ -273,13 +299,11 @@ qualified tok =
         mkName :: Interval -> [String1] -> [(Interval, String1)]
         mkName _ []     = []
         mkName i [x]    = [(i, x)]
-        mkName i (x:xs) = (i0, x) : mkName i1 xs
+        mkName (Interval f p0 p1) (x:xs) = (i0, x) : mkName i1 xs
             where
-                p0 = iStart i
-                p1 = iEnd i
                 p' = movePos (movePosByString p0 x) '.'
-                i0 = Interval p0 p'
-                i1 = Interval p' p1
+                i0 = Interval f p0 p'
+                i1 = Interval f p' p1
 
 
 {--------------------------------------------------------------------------

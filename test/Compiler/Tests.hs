@@ -1,6 +1,3 @@
-{-# LANGUAGE DoAndIfThenElse      #-}
-{-# LANGUAGE LambdaCase           #-}
-{-# LANGUAGE PatternGuards        #-}
 
 module Compiler.Tests where
 
@@ -28,6 +25,7 @@ import Text.Read
 
 import Agda.Utils.List
 import Agda.Utils.List1 (wordsBy, toList)
+import Agda.Utils.Functor ((<&>))
 
 type GHCArgs = [String]
 
@@ -41,12 +39,14 @@ data ExecResult
   deriving (Show, Read, Eq)
 
 data CodeOptimization = NonOptimized | Optimized | MinifiedOptimized
-  deriving (Show, Read, Eq)
+  deriving (Show, Read, Eq, Enum, Bounded)
 
 data Strict = Strict | StrictData | Lazy
-  deriving (Show, Read, Eq)
+  deriving (Show, Read, Eq, Enum, Bounded)
 
-data Compiler = MAlonzo Strict | JS CodeOptimization
+data Compiler
+  = MAlonzo Strict
+  | JS CodeOptimization
   deriving (Show, Read, Eq)
 
 data CompilerOptions
@@ -62,9 +62,9 @@ data TestOptions
     } deriving (Show, Read)
 
 allCompilers :: [Compiler]
-allCompilers =
-  map MAlonzo [Lazy, StrictData, Strict] ++
-  map JS [NonOptimized, Optimized, MinifiedOptimized]
+allCompilers
+  =  [ MAlonzo strict | strict <- [Lazy, StrictData, Strict]]
+  ++ [ JS opt   | opt <- [minBound..] ]
 
 defaultOptions :: TestOptions
 defaultOptions = TestOptions
@@ -76,38 +76,48 @@ defaultOptions = TestOptions
 
 disabledTests :: [RegexFilter]
 disabledTests =
-  [ -----------------------------------------------------------------------------
-    -- These test are disabled on all backends.
-    -- See issue 1528
-    disable "Compiler/.*/simple/Sharing"
-    -- Fix to 2524 is too unsafe
-  , disable "Compiler/.*/simple/Issue2524"
-    -- Issue #2640 (forcing translation for runtime erasure) is still open
-  , disable "Compiler/.*/simple/Erasure-Issue2640"
-    -----------------------------------------------------------------------------
-    -- The test case for #2918 stopped working when inlining of
-    -- recursive pattern-matching lambdas was disabled.
-  , disable "Compiler/MAlonzo_.*/simple/Issue2918$"
-    -----------------------------------------------------------------------------
-    -- The following test cases fail (at least at the time of writing)
-    -- for the JS backend.
-  , disable "Compiler/JS_Optimized/simple/ModuleReexport"
-  , disable "Compiler/JS_MinifiedOptimized/simple/ModuleReexport"
-    -----------------------------------------------------------------------------
-    -- The following test cases use primitives that are not implemented in the
-    -- JS backend.
-  , disable "Compiler/JS_.*/simple/Issue4999"   -- primNatToChar
-    -----------------------------------------------------------------------------
-    -- The following test cases are GHC backend specific and thus disabled on JS.
-  , disable "Compiler/JS_.*/simple/Issue2821"
-  , disable "Compiler/JS_.*/simple/Issue2879-.*"
-  , disable "Compiler/JS_.*/simple/Issue2909-.*"
-  , disable "Compiler/JS_.*/simple/Issue2914"
-  , disable "Compiler/JS_.*/simple/Issue2918$"
-  , disable "Compiler/JS_.*/simple/Issue3732"
-  , disable "Compiler/JS_.*/simple/VecReverseIrr"
-  , disable "Compiler/JS_.*/simple/VecReverseErased"  -- RangeError: Maximum call stack size exceeded
-    -----------------------------------------------------------------------------
+  -----------------------------------------------------------------------------
+  -- The GHC backend no longer allows compiling abstract definitions
+  -- to user-chosen Haskell representations.
+  disable "Compiler/MAlonzo_.*/simple/Issue2524" :
+  -----------------------------------------------------------------------------
+  -- The test case for #2918 stopped working when inlining of
+  -- recursive pattern-matching lambdas was disabled.
+  disable "Compiler/MAlonzo_.*/simple/Issue2918$" :
+  -----------------------------------------------------------------------------
+  -- The following test cases fail (at least at the time of writing)
+  -- for the JS backend.
+  disable "Compiler/JS_Optimized/simple/ModuleReexport" :
+  disable "Compiler/JS_MinifiedOptimized/simple/ModuleReexport" :
+  -----------------------------------------------------------------------------
+  -- The following test cases are GHC backend specific and thus disabled on JS.
+  disable "Compiler/JS_.*/simple/Issue2821" :
+  disable "Compiler/JS_.*/simple/Issue2879-.*" :
+  disable "Compiler/JS_.*/simple/Issue2909-.*" :
+  disable "Compiler/JS_.*/simple/Issue2914" :
+  disable "Compiler/JS_.*/simple/Issue2918$" :
+  disable "Compiler/JS_.*/simple/Issue3732" :
+  disable "Compiler/JS_.*/simple/VecReverseIrr" :
+  disable "Compiler/JS_.*/simple/VecReverseErased" :  -- RangeError: Maximum call stack size exceeded
+  -----------------------------------------------------------------------------
+  []
+  where disable = RFInclude
+
+-- | Filtering out compiler tests that require Agda built with -fdebug.
+
+fdebugTestFilter :: [RegexFilter]
+fdebugTestFilter =
+-- This list was crafted using
+--    grep -RP '(?<!-- ){-# OPTIONS.* -v' | grep Compiler/
+--  and screening the results (e.g. for comments)
+  [ disable "Compiler/simple/UnusedArguments"
+  , disable "Compiler/simple/EraseRefl"
+  , disable "Compiler/simple/InlineRecursive"
+  , disable "Compiler/simple/Word"
+  , disable "Compiler/simple/CompileNumbers"
+  , disable "Compiler/simple/CaseOnCase"
+  , disable "Compiler/simple/CompareNat"
+  , disable "Compiler/simple/CompileCatchAll"
   ]
   where disable = RFInclude
 
@@ -129,25 +139,24 @@ tests = do
       enabledCompilers =
         [ MAlonzo s
         | s <- [Lazy, StrictData] ++
-               if ghcVersionAtLeast9 then [Strict] else []
+               [Strict | ghcVersionAtLeast9]
         ] ++
         [ JS opt
         | isJust nodeBin
-        , opt <- [NonOptimized, Optimized, MinifiedOptimized]
+        , opt   <- [minBound..]
         ]
   _ <- case nodeBin of
     Nothing -> putStrLn "No JS node binary found, skipping JS tests."
     Just n -> putStrLn $ "Using JS node binary at " ++ n
 
-  ts <- mapM forComp enabledCompilers
-  return $ testGroup "Compiler" ts
-  where
-    forComp comp = testGroup (map spaceToUnderscore $ show comp) . catMaybes
+  ts <- forM enabledCompilers \ comp -> do
+    testGroup (map spaceToUnderscore $ show comp) . catMaybes
         <$> sequence
             [ Just <$> simpleTests comp
             , Just <$> stdlibTests comp
             , specialTests comp]
-
+  return $ testGroup "Compiler" ts
+  where
     spaceToUnderscore ' ' = '_'
     spaceToUnderscore c = c
 
@@ -173,7 +182,7 @@ simpleTests comp = do
 stdlibTests :: Compiler -> IO TestTree
 stdlibTests comp = do
   let testDir = "test" </> "Compiler" </> "with-stdlib"
-  let inps    = [testDir </> "AllStdLib.agda"]
+  let inps    = map (testDir </>) ["AllStdLib.agda", "AllStdLibJS.agda"]
     -- put all tests in AllStdLib to avoid compiling the standard library
     -- multiple times
 
@@ -244,8 +253,11 @@ agdaRunProgGoldenTest dir comp extraArgs inp opts =
           let exec = getExecForComp comp compDir inpFile
           case comp of
             JS{} -> do
-              setEnv "NODE_PATH" compDir
-              (ret, out', err') <- PT.readProcessWithExitCode "node" [exec] inp'
+              env <- (("NODE_PATH", compDir) :) <$> getEnvironment
+              nodePath <- fromJust <$> findExecutable "node"
+              (ret, out', err') <- readProcessWithEnv env Nothing nodePath ["--stack-size=4096", exec] inp'
+              out' <- cleanOutput out'
+              err' <- cleanOutput err'
               return $ ExecutedProg $ ProgramResult ret (out <> out') (err <> err')
             _ -> do
               (ret, out', err') <- PT.readProcessWithExitCode exec (runtimeOptions opts) inp'
@@ -278,11 +290,11 @@ agdaRunProgGoldenTest1 dir comp extraArgs inp opts cont
           extraArgs' <- extraArgs
           -- compile file
           let cArgs   = cleanUpOptions (extraAgdaArgs cOpts)
-              defArgs = ["--ignore-interfaces" | notElem "--no-ignore-interfaces" (extraAgdaArgs cOpts)] ++
+              defArgs = ["--ignore-interfaces" | "--no-ignore-interfaces" `notElem` extraAgdaArgs cOpts] ++
                         ["--no-libraries"] ++
                         ["--compile-dir", compDir, "-v0", "-vwarning:1"] ++ extraArgs' ++ cArgs ++ [inp]
           let args = argsForComp comp ++ defArgs
-          res@(ret, out, err) <- readAgdaProcessWithExitCode args T.empty
+          res@(ret, out, err) <- readAgdaProcessWithExitCode Nothing args T.empty
 
           absDir <- canonicalizePath dir
           removePaths [absDir, compDir] <$> case ret of
@@ -295,10 +307,11 @@ agdaRunProgGoldenTest1 dir comp extraArgs inp opts cont
           Lazy       -> []
           StrictData -> ["--ghc-strict-data"]
           Strict     -> ["--ghc-strict"]
-        argsForComp (JS o)  = [ "--js", "--js-verify" ] ++ case o of
-          NonOptimized      -> []
-          Optimized         -> [ "--js-optimize" ]
-          MinifiedOptimized -> [ "--js-optimize", "--js-minify" ]
+        argsForComp (JS opt) = [ "--js", "--js-verify", "--js-es6" ]
+          ++ case opt of
+            NonOptimized      -> []
+            Optimized         -> [ "--js-optimize" ]
+            MinifiedOptimized -> [ "--js-optimize", "--js-minify" ]
 
         removePaths ps = \case
           CompileFailed    r -> CompileFailed    (removePaths' r)
@@ -312,8 +325,12 @@ agdaRunProgGoldenTest1 dir comp extraArgs inp opts cont
 
 readOptions :: FilePath -- file name of the agda file
     -> IO TestOptions
-readOptions inpFile =
-  maybe defaultOptions (read . T.unpack . decodeUtf8) <$> readFileMaybe optFile
+readOptions inpFile = readFileMaybe optFile <&> \case
+    Nothing -> defaultOptions
+    (Just optsBS) ->
+      case readMaybe . T.unpack . decodeUtf8 $ optsBS of
+        Nothing -> error $ "Failed to parse options inside file " <> optFile
+        (Just optsParsed) -> optsParsed
   where optFile = dropAgdaOrOtherExtension inpFile <.> "options"
 
 cleanUpOptions :: AgdaArgs -> AgdaArgs
@@ -321,13 +338,14 @@ cleanUpOptions = filter clean
   where
     clean :: String -> Bool
     clean "--no-ignore-interfaces"         = False
-    clean o | isPrefixOf "--ghc-flag=-j" o = True
+    clean o | "--ghc-flag=-j" `isPrefixOf` o = True
     clean _                                = True
 
 -- gets the generated executable path
 getExecForComp :: Compiler -> FilePath -> FilePath -> FilePath
-getExecForComp JS{} compDir inpFile = compDir </> ("jAgda." ++ (takeFileName $ dropAgdaOrOtherExtension inpFile) ++ ".js")
-getExecForComp _ compDir inpFile = compDir </> (takeFileName $ dropAgdaOrOtherExtension inpFile)
+getExecForComp (JS opt) compDir inpFile
+  = compDir </> ("jAgda." ++ takeFileName (dropAgdaOrOtherExtension inpFile) ++ ".mjs")
+getExecForComp _ compDir inpFile = compDir </> takeFileName (dropAgdaOrOtherExtension inpFile)
 
 printExecResult :: ExecResult -> T.Text
 printExecResult (CompileFailed r)    = "COMPILE_FAILED\n\n"    <> printProgramResult r

@@ -15,8 +15,18 @@ data IsSuc : Nat → Set where
 test : Σ Nat IsSuc → Set
 test = λ (y1 , isSuc y2) → Nat
 
--- ERROR NOW:
+-- ERROR WAS:
 -- Expected record pattern
 -- when checking the let binding y1 , isSuc y2 = .patternInTele0
-
 -- (Talks about desugaring; could still be improved.)
+--
+-- ERROR NOW (2024-10-17):
+--
+-- Expected record pattern
+-- when checking that the expression λ (y1 , isSuc y2) → Nat has type
+-- Σ Nat IsSuc → Set
+
+-- As of 2026-01-20: More precise location.
+-- error: [ShouldBeRecordPattern]
+-- Expected record pattern
+-- when checking that the pattern isSuc y2 has type IsSuc y1

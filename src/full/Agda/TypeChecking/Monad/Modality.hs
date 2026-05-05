@@ -1,4 +1,5 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
+-- {-# OPTIONS_GHC -ddump-simpl -dsuppress-all -dno-suppress-type-signatures -ddump-to-file -dno-typeable-binds #-}
 
 {- | Modality.
 
@@ -22,15 +23,18 @@ import qualified Data.Map as Map
 import Agda.Interaction.Options
 
 import Agda.Syntax.Common
+import Agda.Syntax.Internal
 
 import Agda.TypeChecking.Monad.Base
+import Agda.TypeChecking.Monad.Constraints (MonadConstraint, solveConstraint)
 import Agda.TypeChecking.Monad.Context
 import Agda.TypeChecking.Monad.Debug
 import Agda.TypeChecking.Monad.Env
+import {-# SOURCE #-} Agda.TypeChecking.Rewriting (checkRewConstraint)
 
 import Agda.Utils.Function
-import Agda.Utils.Lens
 import Agda.Utils.Monad
+import Agda.Utils.ExpandCase
 
 -- | data 'Relevance'
 --   see "Agda.Syntax.Common".
@@ -40,10 +44,12 @@ import Agda.Utils.Monad
 -- | Prepare parts of a parameter telescope for abstraction in constructors
 --   and projections.
 hideAndRelParams :: (LensHiding a, LensRelevance a) => a -> a
-hideAndRelParams = hideOrKeepInstance . mapRelevance nonStrictToIrr
+hideAndRelParams = hideOrKeepInstance . mapRelevance shapeIrrelevantToIrrelevant
 
 -- * Operations on 'Context'.
 
+
+{-# INLINE workOnTypes #-}
 -- | Modify the context whenever going from the l.h.s. (term side)
 --   of the typing judgement to the r.h.s. (type side).
 workOnTypes :: (MonadTCEnv m, HasOptions m, MonadDebug m)
@@ -52,14 +58,24 @@ workOnTypes cont = do
   allowed <- optExperimentalIrrelevance <$> pragmaOptions
   verboseBracket "tc.irr" 60 "workOnTypes" $ workOnTypes' allowed cont
 
+{-# INLINE workOnTypes' #-}
 -- | Internal workhorse, expects value of --experimental-irrelevance flag
 --   as argument.
 workOnTypes' :: (MonadTCEnv m) => Bool -> m a -> m a
 workOnTypes' experimental
-  = applyWhen experimental (modifyContextInfo $ mapRelevance irrToNonStrict)
+  = applyWhen experimental (modifyContextInfo $ mapRelevance irrelevantToShapeIrrelevant)
   . applyQuantityToJudgement zeroQuantity
+  . applyPolarityToContext (withStandardLock UnusedPolarity)
   . typeLevelReductions
-  . localTC (\ e -> e { envWorkingOnTypes = True })
+  . localTC (set eWorkingOnTypes True)
+
+applyPolarityToContext :: (MonadTCEnv tcm, LensModalPolarity p) => p -> tcm a -> tcm a
+applyPolarityToContext p = localTC
+  $ over eContext     (fmap $ inverseApplyPolarity pol)
+  . over eLetBindings (Map.map . fmap . onLetBindingType
+                       $ inverseApplyPolarity pol)
+  where
+    pol = getModalPolarity p
 
 -- | (Conditionally) wake up irrelevant variables and make them relevant.
 --   For instance,
@@ -69,10 +85,10 @@ workOnTypes' experimental
 --   Also allow the use of irrelevant definitions.
 applyRelevanceToContext :: (MonadTCEnv tcm, LensRelevance r) => r -> tcm a -> tcm a
 applyRelevanceToContext thing =
-  case getRelevance thing of
-    Relevant -> id
-    rel      -> applyRelevanceToContextOnly   rel
-              . applyRelevanceToJudgementOnly rel
+  applyUnless (isRelevant rel)
+   $ applyRelevanceToContextOnly   rel
+   . applyRelevanceToJudgementOnly rel
+  where rel = getRelevance thing
 
 -- | (Conditionally) wake up irrelevant variables and make them relevant.
 --   For instance,
@@ -82,7 +98,7 @@ applyRelevanceToContext thing =
 --   Precondition: @Relevance /= Relevant@
 applyRelevanceToContextOnly :: (MonadTCEnv tcm) => Relevance -> tcm a -> tcm a
 applyRelevanceToContextOnly rel = localTC
-  $ over eContext     (map $ inverseApplyRelevance rel)
+  $ over eContext     (fmap $ inverseApplyRelevance rel)
   . over eLetBindings (Map.map . fmap . onLetBindingType $ inverseApplyRelevance rel)
 
 -- | Apply relevance @rel@ the the relevance annotation of the (typing/equality)
@@ -92,14 +108,15 @@ applyRelevanceToContextOnly rel = localTC
 applyRelevanceToJudgementOnly :: (MonadTCEnv tcm) => Relevance -> tcm a -> tcm a
 applyRelevanceToJudgementOnly = localTC . over eRelevance . composeRelevance
 
+{-# INLINE applyRelevanceToContextFunBody #-}
 -- | Like 'applyRelevanceToContext', but only act on context if
 --   @--irrelevant-projections@.
 --   See issue #2170.
-applyRelevanceToContextFunBody :: (MonadTCM tcm, LensRelevance r) => r -> tcm a -> tcm a
-applyRelevanceToContextFunBody thing cont =
+applyRelevanceToContextFunBody :: (MonadTCM tcm, ExpandCase (tcm a), LensRelevance r) => r -> tcm a -> tcm a
+applyRelevanceToContextFunBody thing cont = expand \ret ->
   case getRelevance thing of
-    Relevant -> cont
-    rel -> applyWhenM (optIrrelevantProjections <$> pragmaOptions)
+    Relevant{} -> ret cont
+    rel -> ret $ applyWhenM (optIrrelevantProjections <$> pragmaOptions)
       (applyRelevanceToContextOnly rel) $    -- enable local irr. defs only when option
       applyRelevanceToJudgementOnly rel cont -- enable global irr. defs alway
 
@@ -110,7 +127,7 @@ applyRelevanceToContextFunBody thing cont =
 applyQuantityToJudgement ::
   (MonadTCEnv tcm, LensQuantity q) => q -> tcm a -> tcm a
 applyQuantityToJudgement =
-  localTC . over eQuantity . composeQuantity . getQuantity
+  localTC . over eQuantityZeroHardCompile . composeQuantity . getQuantity
 
 -- | Apply inverse composition with the given cohesion to the typing context.
 applyCohesionToContext :: (MonadTCEnv tcm, LensCohesion m) => m -> tcm a -> tcm a
@@ -122,7 +139,7 @@ applyCohesionToContext thing =
 
 applyCohesionToContextOnly :: (MonadTCEnv tcm) => Cohesion -> tcm a -> tcm a
 applyCohesionToContextOnly q = localTC
-  $ over eContext     (map $ inverseApplyCohesion q)
+  $ over eContext     (fmap $ inverseApplyCohesion q)
   . over eLetBindings (Map.map . fmap . onLetBindingType $ inverseApplyCohesion q)
 
 -- | Can we split on arguments of the given cohesion?
@@ -130,6 +147,26 @@ splittableCohesion :: (HasOptions m, LensCohesion a) => a -> m Bool
 splittableCohesion a = do
   let c = getCohesion a
   pure (usableCohesion c) `and2M` (pure (c /= Flat) `or2M` do optFlatSplit <$> pragmaOptions)
+
+{-# NOINLINE applyDomToContext' #-}
+applyDomToContext' :: RewDom' Term -> TCM ()
+applyDomToContext' r = checkRewConstraint (rewDomEq r)
+
+{-# INLINE applyDomToContext #-}
+-- | Apply modalities and equational constraints (local rewrite rules) to the
+--   context.
+applyDomToContext :: Dom e -> TCM a -> TCM a
+applyDomToContext d act = do
+  expand \ret -> case rewDom d of
+    Nothing -> ret $ pure ()
+    Just c  -> ret $ applyDomToContext' c
+  applyModalityToContext d act
+
+{-# INLINE addRewConstraint #-}
+-- | Adds an equational constraint due to a local rewrite rule.
+addRewConstraint :: MonadConstraint tcm
+  => LocalEquation -> tcm ()
+addRewConstraint = solveConstraint . RewConstraint
 
 -- | (Conditionally) wake up irrelevant variables and make them relevant.
 --   For instance,
@@ -139,12 +176,20 @@ splittableCohesion a = do
 --   Also allow the use of irrelevant definitions.
 --
 --   This function might also do something for other modalities.
-applyModalityToContext :: (MonadTCEnv tcm, LensModality m) => m -> tcm a -> tcm a
-applyModalityToContext thing =
+{-# INLINE applyModalityToContext #-}
+applyModalityToContext :: (MonadTCEnv tcm, ExpandCase (tcm a), LensModality m) => m -> tcm a -> tcm a
+applyModalityToContext !thing !act = expand \ret ->
   case getModality thing of
-    m | m == unitModality -> id
-      | otherwise         -> applyModalityToContextOnly   m
-                           . applyModalityToJudgementOnly m
+    m | noinlineEqModality m unitModality -> ret act
+      | otherwise                         -> ret $ localTC (applyModalityToContext' m) act
+
+{-# NOINLINE applyModalityToContext' #-}
+applyModalityToContext' :: Modality -> TCEnv -> TCEnv
+applyModalityToContext' m e =
+  e & over eContext     (fmap $ inverseApplyModalityButNotQuantity m)
+    & over eLetBindings (Map.map . fmap . onLetBindingType $ inverseApplyModalityButNotQuantity m)
+    & over eRelevance                (composeRelevance (getRelevance m))
+    & over eQuantityZeroHardCompile  (composeQuantity  (getQuantity m))
 
 -- | (Conditionally) wake up irrelevant variables and make them relevant.
 --   For instance,
@@ -156,30 +201,42 @@ applyModalityToContext thing =
 --   not for quantities.
 --
 --   Precondition: @Modality /= Relevant@
+{-# INLINE applyModalityToContextOnly #-}
 applyModalityToContextOnly :: (MonadTCEnv tcm) => Modality -> tcm a -> tcm a
-applyModalityToContextOnly m = localTC
-  $ over eContext (map $ inverseApplyModalityButNotQuantity m)
-  . over eLetBindings
-      (Map.map . fmap . onLetBindingType $ inverseApplyModalityButNotQuantity m)
+applyModalityToContextOnly m = localTC (applyModalityToContextOnly' m)
+
+{-# NOINLINE applyModalityToContextOnly' #-}
+applyModalityToContextOnly' :: Modality -> TCEnv -> TCEnv
+applyModalityToContextOnly' m e =
+  e & over eContext     (fmap $ inverseApplyModalityButNotQuantity m)
+    & over eLetBindings (Map.map . fmap . onLetBindingType $ inverseApplyModalityButNotQuantity m)
+
 
 -- | Apply the relevance and quantity components of the modality to
 -- the modality annotation of the (typing/equality) judgement.
 --
 -- Precondition: The relevance component must not be 'Relevant'.
+{-# INLINE applyModalityToJudgementOnly #-}
 applyModalityToJudgementOnly :: (MonadTCEnv tcm) => Modality -> tcm a -> tcm a
-applyModalityToJudgementOnly m =
-  localTC $ over eRelevance (composeRelevance (getRelevance m)) .
-            over eQuantity  (composeQuantity  (getQuantity m))
+applyModalityToJudgementOnly m = localTC (applyModalityToJudgementOnly' m)
 
+{-# NOINLINE applyModalityToJudgementOnly' #-}
+applyModalityToJudgementOnly' :: Modality -> TCEnv -> TCEnv
+applyModalityToJudgementOnly' m e =
+  e & over eRelevance                (composeRelevance (getRelevance m))
+    & over eQuantityZeroHardCompile  (composeQuantity  (getQuantity m))
+
+{-# INLINE applyModalityToContextFunBody #-}
 -- | Like 'applyModalityToContext', but only act on context (for Relevance) if
 --   @--irrelevant-projections@.
 --   See issue #2170.
-applyModalityToContextFunBody :: (MonadTCM tcm, LensModality r) => r -> tcm a -> tcm a
+applyModalityToContextFunBody :: (MonadTCM tcm, LensModality r, ExpandCase (tcm a)) => r -> tcm a -> tcm a
 applyModalityToContextFunBody thing cont = do
     ifM (optIrrelevantProjections <$> pragmaOptions)
       {-then-} (applyModalityToContext m cont)                -- enable global irr. defs always
       {-else-} (applyRelevanceToContextFunBody (getRelevance m)
                $ applyCohesionToContext (getCohesion m)
+               $ applyPolarityToContext (getModalPolarity m)
                $ applyQuantityToJudgement (getQuantity m) cont) -- enable local irr. defs only when option
   where
     m = getModality thing
@@ -196,5 +253,5 @@ applyModalityToContextFunBody thing cont = do
 --   Also set the current quantity to 0.
 wakeIrrelevantVars :: (MonadTCEnv tcm) => tcm a -> tcm a
 wakeIrrelevantVars
-  = applyRelevanceToContextOnly Irrelevant
+  = applyRelevanceToContextOnly irrelevant
   . applyQuantityToJudgement zeroQuantity

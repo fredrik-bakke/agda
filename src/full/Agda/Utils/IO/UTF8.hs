@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 -- | Text IO using the UTF8 character encoding.
 
 module Agda.Utils.IO.UTF8
@@ -11,11 +13,11 @@ module Agda.Utils.IO.UTF8
 import Control.Exception
 import Data.Maybe (fromMaybe)
 import Data.Text.Lazy (Text)
-import qualified Data.Text.Lazy as T
-import qualified Data.Text.Lazy.Encoding as T
-import qualified Data.Text.Lazy.IO as T
-import qualified Data.ByteString.Lazy as BS
-import qualified System.IO as IO
+import Data.Text.Lazy qualified as T
+import Data.Text.Lazy.Encoding qualified as T
+import Data.Text.Lazy.IO qualified as T
+import Data.ByteString.Lazy qualified as BS
+import System.IO qualified as IO
 
 -- | Converts many character sequences which may be interpreted as
 -- line or paragraph separators into '\n'.
@@ -55,6 +57,9 @@ instance Exception ReadException where
   displayException (DecodingError file) =
     "Failed to read " ++ file ++ ".\n" ++
     "Please ensure that this file uses the UTF-8 character encoding."
+#if MIN_VERSION_base(4,20,0)
+  backtraceDesired (DecodingError _) = False
+#endif
 
 -- | Reads a UTF8-encoded text file and converts many character
 -- sequences which may be interpreted as line or paragraph separators

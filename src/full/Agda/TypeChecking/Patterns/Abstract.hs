@@ -7,6 +7,7 @@ module Agda.TypeChecking.Patterns.Abstract where
 import Control.Monad.Except
 
 import qualified Data.List as List
+import Data.Functor
 import Data.Void
 
 import qualified Agda.Syntax.Abstract as A
@@ -19,6 +20,7 @@ import Agda.Syntax.Literal
 import Agda.Syntax.Position
 
 import Agda.TypeChecking.Monad
+import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Warnings (raiseWarningsOnUsage)
 
 import Agda.Utils.Impossible
@@ -30,25 +32,17 @@ expandLitPattern
   => A.Pattern -> m A.Pattern
 expandLitPattern = \case
   A.LitP info (LitNat n)
-    | n < 0     -> negLit -- Andreas, issue #2365, negative literals not yet supported.
-    | n > 20    -> tooBig
+    | n < 0     -> typeError NegativeLiteralInPattern  -- Andreas, issue #2365, negative literals not yet supported.
+    | n > 20    -> typeError LiteralTooBig
     | otherwise -> do
-      Con z _ _ <- primZero
-      Con s _ _ <- primSuc
+      z <- getBuiltinName_ builtinZero
+      s <- getBuiltinName_ builtinSuc
       let r     = getRange info
-      let zero  = A.ConP cinfo (unambiguous $ setRange r $ conName z) []
-          suc p = A.ConP cinfo (unambiguous $ setRange r $ conName s) [defaultNamedArg p]
+      let zero  = A.ConP cinfo (unambiguous $ setRange r z) []
+          suc p = A.ConP cinfo (unambiguous $ setRange r s) [defaultNamedArg p]
           cinfo = A.ConPatInfo ConOCon info ConPatEager
       return $ foldr ($) zero $ List.genericReplicate n suc
   p -> return p
-
-  where
-    tooBig = typeError $ GenericError $
-      "Matching on natural number literals is done by expanding " ++
-      "the literal to the corresponding constructor pattern, so " ++
-      "you probably don't want to do it this way."
-    negLit = typeError $ GenericError $
-      "Negative literals are not supported in patterns"
 
 
 -- | Expand away (deeply) all pattern synonyms in a pattern.
@@ -73,7 +67,7 @@ expandPatternSynonyms' :: forall e. A.Pattern' e -> TCM (A.Pattern' e)
 expandPatternSynonyms' = postTraverseAPatternM $ \case
 
   A.PatternSynP i x as -> setCurrentRange i $ do
-    (ns, p) <- killRange <$> lookupPatternSyn x
+    A.PatternSynDefn ns p <- killRange <$> lookupPatternSyn x
 
     -- Andreas, 2020-02-11, issue #3734
     -- If lookup of ambiguous pattern synonym was successful,
@@ -82,13 +76,18 @@ expandPatternSynonyms' = postTraverseAPatternM $ \case
     -- This is less than optimal, since we do not rule out
     -- the invalid alternatives by typing, but we cannot do
     -- better here.
-    mapM_ raiseWarningsOnUsage $ A.unAmbQ x
+    mapM_ raiseWarningsOnUsage $ A.getAmbiguous x
 
     -- Must expand arguments before instantiating otherwise pattern
     -- synonyms could get into dot patterns (which is __IMPOSSIBLE__).
     p <- expandPatternSynonyms' (vacuous p :: A.Pattern' e)
 
-    case A.insertImplicitPatSynArgs (A.WildP . PatRange) (getRange x) ns as of
+    reportSDoc "scope.patsyn" 80 $ vcat
+      [ "calling insertImplicitPatSynArgs"
+      , "- patsyn parameters: " <+> (text . show) (killRange ns)
+      , "- patsyn arguments:  " <+> (text . show) (fmap (fmap void) as)
+      ]
+    case A.insertImplicitPatSynArgs (\ _h r -> A.WildP (PatRange r)) (getRange x) ns as of
       Nothing       -> typeError $ BadArgumentsToPatternSynonym x
       Just (_, _:_) -> typeError $ TooFewArgumentsToPatternSynonym x
       Just (s, [])  -> do

@@ -5,22 +5,22 @@
 module Agda.Syntax.Internal.Names where
 
 import Data.HashMap.Strict (HashMap)
-import qualified Data.HashMap.Strict as HMap
 import Data.Map (Map)
 import Data.Set (Set)
 
 import Agda.Syntax.Common
 import Agda.Syntax.Literal
 import Agda.Syntax.Internal
-import qualified Agda.Syntax.Concrete as C
-import qualified Agda.Syntax.Abstract as A
+import Agda.Syntax.Concrete qualified as C
+import Agda.Syntax.Abstract qualified as A
+import Agda.Syntax.Abstract (PatternSynDefn(..))
 import Agda.Syntax.Treeless
 
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.CompiledClause
 
 import Agda.Utils.List1 (List1)
-import qualified Agda.Utils.Maybe.Strict as Strict
+import Agda.Utils.Maybe.Strict qualified as Strict
 import Agda.Utils.Singleton
 import Agda.Utils.Impossible
 
@@ -88,9 +88,8 @@ instance NamesIn a => NamesIn (Open a)
 instance NamesIn a => NamesIn (C.FieldAssignment' a)
 
 instance (NamesIn a, NamesIn b) => NamesIn (Dom' a b) where
-  namesAndMetasIn' sg (Dom _ _ _ t e) =
-    mappend (namesAndMetasIn' sg t) (namesAndMetasIn' sg e)
-
+  namesAndMetasIn' sg (Dom _ _ _ t r e) =
+    namesAndMetasIn' sg (t, r, e)
 
 -- Specific collections
 instance NamesIn a => NamesIn (Tele a)
@@ -99,26 +98,34 @@ instance NamesIn a => NamesIn (Tele a)
 
 instance (NamesIn a, NamesIn b) => NamesIn (a, b) where
   namesAndMetasIn' sg (x, y) =
-    mappend (namesAndMetasIn' sg x) (namesAndMetasIn' sg y)
+    namesAndMetasIn' sg x <> namesAndMetasIn' sg y
+  {-# INLINE namesAndMetasIn' #-}
 
 instance (NamesIn a, NamesIn b, NamesIn c) => NamesIn (a, b, c) where
-  namesAndMetasIn' sg (x, y, z) = namesAndMetasIn' sg (x, (y, z))
+  namesAndMetasIn' sg (x, y, z) =
+    namesAndMetasIn' sg x <> namesAndMetasIn' sg y <> namesAndMetasIn' sg z
+  {-# INLINE namesAndMetasIn' #-}
 
 instance (NamesIn a, NamesIn b, NamesIn c, NamesIn d) => NamesIn (a, b, c, d) where
   namesAndMetasIn' sg (x, y, z, u) =
-    namesAndMetasIn' sg ((x, y), (z, u))
+    namesAndMetasIn' sg x <> namesAndMetasIn' sg y <> namesAndMetasIn' sg z <> namesAndMetasIn' sg u
+  {-# INLINE namesAndMetasIn' #-}
 
 instance
   (NamesIn a, NamesIn b, NamesIn c, NamesIn d, NamesIn e) =>
   NamesIn (a, b, c, d, e) where
   namesAndMetasIn' sg (x, y, z, u, v) =
-    namesAndMetasIn' sg ((x, y), (z, (u, v)))
+    namesAndMetasIn' sg x <> namesAndMetasIn' sg y <> namesAndMetasIn' sg z <> namesAndMetasIn' sg u
+    <> namesAndMetasIn' sg v
+  {-# INLINE namesAndMetasIn' #-}
 
 instance
   (NamesIn a, NamesIn b, NamesIn c, NamesIn d, NamesIn e, NamesIn f) =>
   NamesIn (a, b, c, d, e, f) where
   namesAndMetasIn' sg (x, y, z, u, v, w) =
-    namesAndMetasIn' sg ((x, (y, z)), (u, (v, w)))
+    namesAndMetasIn' sg x <> namesAndMetasIn' sg y <> namesAndMetasIn' sg z <> namesAndMetasIn' sg u
+    <> namesAndMetasIn' sg v <> namesAndMetasIn' sg w
+  {-# INLINE namesAndMetasIn' #-}
 
 instance NamesIn CompKit where
   namesAndMetasIn' sg (CompKit a b) = namesAndMetasIn' sg (a,b)
@@ -137,28 +144,34 @@ instance NamesIn ConHead where
 instance NamesIn Bool where
   namesAndMetasIn' _ _ = mempty
 
+instance NamesIn Int where
+  namesAndMetasIn' _ _ = mempty
+
 -- Andreas, 2017-07-27
 -- In the following clauses, the choice of fields is not obvious
 -- to the reader.  Please comment on the choices.
 
 instance NamesIn Definition where
   namesAndMetasIn' sg
-    (Defn _ _ t _ _ _ _ disp _ _ _ _ _ _ _ _ _ _ def) =
+    (Defn _ _ t _ _ _ disp _ _ _ _ _ _ _ _ _ _ _ def) =
     namesAndMetasIn' sg (t, def, disp)
 
 instance NamesIn Defn where
   namesAndMetasIn' sg = \case
     Axiom _            -> mempty
-    DataOrRecSig _     -> mempty
-    GeneralizableVar   -> mempty
+    DataOrRecSig _ _   -> mempty
+    GeneralizableVar _ -> mempty
     PrimitiveSort _ s  -> namesAndMetasIn' sg s
     AbstractDefn{}     -> __IMPOSSIBLE__
     -- Andreas 2017-07-27, Q: which names can be in @cc@ which are not already in @cl@?
-    Function cl cc _ _ _ _ _ _ _ _ _ _ el _ _ _
-      -> namesAndMetasIn' sg (cl, cc, el)
-    Datatype _ _ cl cs s _ _ _ trX trD
+    Function cl cc _ _ _ _ _ prj _ _ el _ _ _
+      -- Andreas, 2025-11-18, issue #8037
+      -- When copying the record type along with one of its projections in a module application,
+      -- we need to make sure the record type has not been deleted as deadcode.
+      -> namesAndMetasIn' sg (cl, cc, el, prj)
+    Datatype _ _ cl cs s _ _ _ _ trX trD
       -> namesAndMetasIn' sg (cl, cs, s, trX, trD)
-    Record _ cl c _ fs recTel _ _ _ _ _ _ comp
+    Record _ cl c _ fs recTel _ _ _ _ _ _ _ comp
       -> namesAndMetasIn' sg (cl, c, fs, recTel, comp)
     Constructor _ _ c d _ kit fs _ _ _ _
       -> namesAndMetasIn' sg (c, d, kit, fs)
@@ -166,13 +179,28 @@ instance NamesIn Defn where
       -> namesAndMetasIn' sg (cl, cc)
 
 instance NamesIn Clause where
-  namesAndMetasIn' sg (Clause _ _ tel ps b t _ _ _ _ _ _) =
+  namesAndMetasIn' sg (Clause _ _ tel ps b t _ _ _ _ _) =
     namesAndMetasIn' sg (tel, ps, b, t)
 
+instance NamesIn ProjectionLikenessMissing where
+  {-# INLINE namesAndMetasIn' #-}
+  namesAndMetasIn' _ = mempty
+
+instance NamesIn Projection where
+  {-# INLINE namesAndMetasIn' #-}
+  namesAndMetasIn' sg p = namesAndMetasIn' sg (projProper p)
+
+instance (NamesIn a, NamesIn b) => NamesIn (Either a b) where
+  {-# INLINE namesAndMetasIn' #-}
+  namesAndMetasIn' sg = \case
+    Left a  -> namesAndMetasIn' sg a
+    Right b -> namesAndMetasIn' sg b
+
 instance NamesIn CompiledClauses where
-  namesAndMetasIn' sg (Case _ c) = namesAndMetasIn' sg c
-  namesAndMetasIn' sg (Done _ v) = namesAndMetasIn' sg v
-  namesAndMetasIn' sg (Fail _)   = mempty
+  namesAndMetasIn' sg = \case
+    Case _ c     -> namesAndMetasIn' sg c
+    Done _ _ _ v -> namesAndMetasIn' sg v
+    Fail _       -> mempty
 
 -- Andreas, 2017-07-27
 -- Why ignoring the litBranches?
@@ -185,15 +213,15 @@ instance NamesIn (Pattern' a) where
     VarP _ _        -> mempty
     LitP _ l        -> namesAndMetasIn' sg l
     DotP _ v        -> namesAndMetasIn' sg v
-    ConP c _ args   -> namesAndMetasIn' sg (c, args)
+    ConP c cpi args -> namesAndMetasIn' sg (c, cpi, args)
     DefP o q args   -> namesAndMetasIn' sg (q, args)
     ProjP _ f       -> namesAndMetasIn' sg f
     IApplyP _ t u _ -> namesAndMetasIn' sg (t, u)
 
-instance NamesIn a => NamesIn (Type' a) where
+instance (NamesIn a, NamesIn b) => NamesIn (Type'' a b) where
   namesAndMetasIn' sg (El s t) = namesAndMetasIn' sg (s, t)
 
-instance NamesIn Sort where
+instance NamesIn a => NamesIn (Sort' a) where
   namesAndMetasIn' sg = \case
     Univ _ l    -> namesAndMetasIn' sg l
     Inf _ _     -> mempty
@@ -222,10 +250,10 @@ instance NamesIn Term where
     DontCare v   -> namesAndMetasIn' sg v
     Dummy _ args -> namesAndMetasIn' sg args
 
-instance NamesIn Level where
+instance NamesIn a => NamesIn (Level' a) where
   namesAndMetasIn' sg (Max _ ls) = namesAndMetasIn' sg ls
 
-instance NamesIn PlusLevel where
+instance NamesIn a => NamesIn (PlusLevel' a) where
   namesAndMetasIn' sg (Plus _ l) = namesAndMetasIn' sg l
 
 -- For QName and Meta literals!
@@ -281,7 +309,7 @@ instance NamesIn Section where
 
 instance NamesIn NLPat where
   namesAndMetasIn' sg = \case
-    PVar _ _      -> mempty
+    PVar _ _ _    -> mempty
     PDef a b      -> namesAndMetasIn' sg (a, b)
     PLam _ a      -> namesAndMetasIn' sg a
     PPi a b       -> namesAndMetasIn' sg (a, b)
@@ -302,13 +330,28 @@ instance NamesIn NLPSort where
     PLevelUniv    -> mempty
     PIntervalUniv -> mempty
 
-instance NamesIn RewriteRule where
+instance NamesIn GlobalRewriteRule where
   namesAndMetasIn' sg = \case
-    RewriteRule a b c d e f _ ->
+    GlobalRewriteRule a b c d e f _ _ ->
       namesAndMetasIn' sg (a, b, c, d, e, f)
 
-instance (NamesIn a, NamesIn b) => NamesIn (HashMap a b) where
-  namesAndMetasIn' sg = namesAndMetasIn' sg . HMap.toList
+instance NamesIn a => NamesIn (LocalEquation' a) where
+  namesAndMetasIn' sg (LocalEquation a b c d) = namesAndMetasIn' sg (a, b, c, d)
+
+instance NamesIn RewriteHead where
+  namesAndMetasIn' sg (RewVarHead a) = namesAndMetasIn' sg a
+  namesAndMetasIn' sg (RewDefHead a) = namesAndMetasIn' sg a
+
+instance NamesIn RewriteRule where
+  namesAndMetasIn' sg (RewriteRule a b c d e) =
+    namesAndMetasIn' sg (a, b, c, d, e)
+
+instance NamesIn a => NamesIn (RewDom' a) where
+  namesAndMetasIn' sg (RewDom a b) =
+    namesAndMetasIn' sg (a, b)
+
+instance (NamesIn b) => NamesIn (HashMap a b) where
+  namesAndMetasIn' sg map = foldMap (namesAndMetasIn' sg) map
 
 instance NamesIn System where
   namesAndMetasIn' sg (System tel cs) = namesAndMetasIn' sg (tel, cs)
@@ -362,9 +405,11 @@ instance NamesIn Compiled where
 
 -- Pattern synonym stuff --
 
-newtype PSyn = PSyn A.PatternSynDefn
-instance NamesIn PSyn where
-  namesAndMetasIn' sg (PSyn (_args, p)) = namesAndMetasIn' sg p
+instance NamesIn PatternSynDefn where
+  namesAndMetasIn' sg (PatternSynDefn _args p) = namesAndMetasIn' sg p
+
+instance NamesIn ConPatternInfo where
+  namesAndMetasIn' sg (ConPatternInfo _ _ _ ty _) = namesAndMetasIn' sg ty
 
 instance NamesIn (A.Pattern' a) where
   namesAndMetasIn' sg = \case
@@ -377,11 +422,10 @@ instance NamesIn (A.Pattern' a) where
     A.AbsurdP _            -> mempty
     A.LitP _ l             -> namesAndMetasIn' sg l
     A.PatternSynP _ c args -> namesAndMetasIn' sg (c, args)
-    A.RecP _ fs            -> namesAndMetasIn' sg fs
+    A.RecP _ _ fs          -> namesAndMetasIn' sg fs
     A.DotP{}               -> __IMPOSSIBLE__    -- Dot patterns are not allowed in pattern synonyms
     A.EqualP{}             -> __IMPOSSIBLE__    -- Andrea: should we allow these in pattern synonyms?
     A.WithP _ p            -> namesAndMetasIn' sg p
-    A.AnnP _ a p           -> __IMPOSSIBLE__    -- Type annotations are not (yet) allowed in pattern synonyms
 
 instance NamesIn AmbiguousQName where
-  namesAndMetasIn' sg (AmbQ cs) = namesAndMetasIn' sg cs
+  namesAndMetasIn' sg = namesAndMetasIn' sg . getAmbiguous

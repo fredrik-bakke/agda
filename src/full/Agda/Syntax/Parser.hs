@@ -3,13 +3,14 @@ module Agda.Syntax.Parser
     ( -- * Types
       Parser
       -- * Parse functions
-    , Agda.Syntax.Parser.parse
-    , Agda.Syntax.Parser.parsePosString
+    , parse
+    , parsePosString
+    , parseRangeString
     , parseFile
       -- * Parsers
     , moduleParser
     , moduleNameParser
-    , acceptableFileExts
+    , agdaFileExtensions
     , exprParser
     , exprWhereParser
     , holeContentParser
@@ -35,7 +36,10 @@ import Data.Text.Lazy (Text)
 
 import Agda.Syntax.Common
 import Agda.Syntax.Position
-import Agda.Syntax.Parser.Monad as M hiding (Parser, parseFlags)
+import Agda.Syntax.Parser.Monad
+  ( ParseError(..), ParseWarning(..), ParseResult(..), ParseFlags, LexState
+  , ParseState (parseWarnings, parseAttributes), defaultParseFlags, parseKeepComments
+  )
 import qualified Agda.Syntax.Parser.Monad as M
 import qualified Agda.Syntax.Parser.Parser as P
 import Agda.Syntax.Parser.Lexer
@@ -46,7 +50,7 @@ import Agda.Syntax.Parser.Tokens
 
 import Agda.Utils.FileName
 import Agda.Utils.IO.UTF8 (readTextFile)
-import Agda.Utils.Maybe   (forMaybe)
+import Agda.Utils.Maybe   (forMaybe, fromMaybe)
 import qualified Agda.Utils.Maybe.Strict as Strict
 
 ------------------------------------------------------------------------
@@ -90,7 +94,7 @@ readFilePM file =
 
 wrapIOM :: (MonadError e m, MonadIO m) => (IOError -> e) -> IO a -> m a
 wrapIOM f m = do
-  a <- liftIO$ (Right <$> m) `catch` (\err -> return$ Left (err :: IOError))
+  a <- liftIO $ (Right <$> m) `catch` (\ err -> return $ Left (err :: IOError))
   case a of
     Right x  -> return x
     Left err -> throwError (f err)
@@ -107,7 +111,7 @@ data Parser a = Parser
   }
 
 type LiterateParser a =
-  Parser a -> [Layer] -> PM (a, Attributes)
+  Parser a -> SrcFile -> [Layer] -> PM (a, Attributes)
 
 -- | Initial state for lexing.
 
@@ -136,24 +140,24 @@ parseFileFromString src p = wrapM . return . M.parseFromSrc (parseFlags p) layou
 -- | Parse with top-level layout.
 
 parseLiterateWithoutComments :: LiterateParser a
-parseLiterateWithoutComments p layers = parseFileFromString (literateSrcFile layers) p $ illiterate layers
+parseLiterateWithoutComments p f layers = parseFileFromString f p $ illiterate layers
 
 -- | Parse with top-level layout.
 
 parseLiterateWithComments :: LiterateParser [Token]
-parseLiterateWithComments p layers = do
-  (code, coh) <- parseLiterateWithoutComments p layers
+parseLiterateWithComments p f layers = do
+  (code, coh) <- parseLiterateWithoutComments p f layers
   let literate = filter (not . isCodeLayer) layers
   let (terms, overlaps) = interleaveRanges (map Left code) (map Right literate)
 
   forM_ (map fst overlaps) $ \c ->
-    warning $ OverlappingTokensWarning { warnRange = getRange c }
+    warning $ OverlappingTokensWarning { warnRange = f <$ getRangeWithoutFile c }
 
-  (, coh) <$> (return $ forMaybe terms $ \case
-    Left t                           -> Just t
-    Right (Layer Comment interval s) -> Just $ TokTeX    (interval, s)
-    Right (Layer Markup  interval s) -> Just $ TokMarkup (interval, s)
-    Right (Layer Code _ _)           -> Nothing)
+  return . (,coh) . forMaybe terms $ \case
+      Left t                           -> Just t
+      Right (Layer Comment interval s) -> Just $ TokTeX    (f <$ interval, s)
+      Right (Layer Markup  interval s) -> Just $ TokMarkup (f <$ interval, s)
+      Right (Layer Code _ _)           -> Nothing
 
 
 parseLiterateFile
@@ -165,37 +169,48 @@ parseLiterateFile
      -- ^ The file contents. Note that the file is /not/ read from
      -- disk.
   -> PM (a, Attributes)
-parseLiterateFile po p path = parseLiterate p p . po (startPos (Just path))
+parseLiterateFile po p path = parseLiterate p p (pure path) . po (startPos' ())
 
-parsePosString ::
-  Parser a -> Position -> String -> PM (a, Attributes)
+parsePosString :: Parser a -> Position -> String -> PM (a, Attributes)
 parsePosString p pos = wrapM . return . M.parsePosString pos (parseFlags p) normalLexState (parser p)
+
+-- | Calls 'parsePosString' with 'Position' extracted from the Range.
+parseRangeString :: Parser a -> Range -> String -> PM (a, Attributes)
+parseRangeString p = parsePosString p . fromMaybe (startPos Nothing) . rStart
 
 -- | Extensions supported by `parseFile`.
 
-acceptableFileExts :: [String]
-acceptableFileExts = ".agda" : (fst <$> literateProcessors)
+agdaFileExtensions :: [String]
+agdaFileExtensions = ".agda" : literateExts
 
-parseFile
-  :: Show a
-  => Parser a
+-- | Parse a file.
+--
+--   The 'Bool' parameter controls whether only @```agda@ blocks
+--   are treated as Agda code in Markdown/Typst files.
+--   When @True@, only blocks marked @```agda@ are considered code.
+--   When @False@, both @```@ and @```agda@ blocks are code (default).
+
+parseFile ::
+     Bool
+     -- ^ When @True@, only treat @```agda@ blocks as code in Markdown/Typst.
+  -> Parser a
   -> RangeFile
      -- ^ The file.
   -> String
      -- ^ The file contents. Note that the file is /not/ read from
      -- disk.
   -> PM ((a, Attributes), FileType)
-parseFile p file input =
+parseFile onlyAgdaBlocks p file input =
   if ".agda" `List.isSuffixOf` path then
     (, AgdaFileType) <$> parseFileFromString (Strict.Just file) p input
   else
-    go literateProcessors
+    go (literateProcessors onlyAgdaBlocks)
   where
     path = filePath (rangeFilePath file)
 
     go [] = throwError InvalidExtensionError
                    { errPath = file
-                   , errValidExts = acceptableFileExts
+                   , errValidExts = agdaFileExtensions
                    }
     go ((ext, (po, ft)) : pos)
       | ext `List.isSuffixOf` path =

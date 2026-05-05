@@ -1,4 +1,8 @@
-Issue2307.agda:20,9-13
-g (c a) != h (record { f = a }) of type R
+Issue2307.agda:20.9-13: error: [UnequalTerms]
+The terms
+  g (c a)
+and
+  h (record { f = a })
+are not equal at type R
 when checking that the expression refl has type
 g (c a) ≡ h (record { f = a })

@@ -24,7 +24,7 @@ modality modeled after `Spatial Type Theory
 <https://arxiv.org/abs/1509.07584/>`_ and `Crisp Type Theory
 <https://arxiv.org/abs/1801.07664/>`_. It is similar to a necessity modality.
 
-This attribute is enabled using the flag :option:`--cohesion`.
+This attribute is enabled using the infective flag :option:`--cohesion`.
 
 We can define ``♭ A`` as a type for any ``(@♭ A : Set l)`` via an
 inductive definition:
@@ -82,3 +82,39 @@ Note that in Cubical Agda functions that match on an argument marked
 with ``@♭`` trigger the ``UnsupportedIndexedMatch`` warning (see
 :ref:`indexed-inductive-types`), and the code might not compute
 properly.
+
+
+.. _sharp:
+
+The Sharp Modality
+----------------------------
+
+The :option:`--cohesion` flag also enables the sharp modality as presented
+in `Cohesive Homotopy Type Theory <https://arxiv.org/abs/1509.07584>`_.
+The annotation ``@♯/@sharp`` is an idempotent monadic modality, which is
+right adjoint to the ``@♭`` modality.
+
+We can define ``♯`` as the following record type:
+
+::
+
+  record ♯ {l} (@♯ A : Set l) : Set l where
+    constructor conSharp
+    field
+      @♯ ε : A
+
+  open ♯
+
+  _ : ∀ {@♭ l} {@♭ A : Set l} → @♭ ♯ A → A
+  _ = ε
+
+When providing a ``@♯`` argument, every non ``@⊤`` variable becomes
+``@♭`` annotated. As a record, we can define elements of ``♯`` by
+copattern matching. After copattern matching with ``ε``, all variables
+in the context become crisp, for example, in the following, we can use
+``a`` in the constuctor of ``♭``.
+
+.. code-block:: agda
+
+  unit : ∀ {@♭ A : Set} → A → ♯ (♭ A)
+  unit a .ε = con a

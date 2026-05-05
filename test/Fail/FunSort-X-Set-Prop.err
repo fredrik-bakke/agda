@@ -1,3 +1,7 @@
-FunSort-X-Set-Prop.agda:6,13-18
-Prop != Set _5
+FunSort-X-Set-Prop.agda:6.13-18: error: [UnequalTypes]
+The types
+  Prop
+and
+  Set _5
+are not equal
 when checking that the expression A → B has type Set

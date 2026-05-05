@@ -2,16 +2,15 @@
 
 module Agda.Syntax.Translation.ReflectedToAbstract where
 
-import Control.Arrow        ( (***) )
 import Control.Monad        ( foldM )
 import Control.Monad.Except ( MonadError )
 import Control.Monad.Reader ( MonadReader(..), asks, reader, runReaderT )
 
 import Data.Maybe
 import Data.Set (Set)
-import qualified Data.Set as Set
+import Data.Set qualified as Set
 import Data.Text (Text)
-import qualified Data.Text as Text
+import Data.Text qualified as Text
 
 import Agda.Syntax.Literal
 import Agda.Syntax.Position
@@ -21,11 +20,10 @@ import Agda.Syntax.Abstract
   ( Name, QName, QNamed(QNamed)
   , isNoName, nameConcrete, nextName, qualify, unambiguous
   )
-import qualified Agda.Syntax.Abstract as A
+import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Abstract.Pattern
 import Agda.Syntax.Reflected as R
-import Agda.Syntax.Internal (Dom,Dom'(..))
-
+import Agda.Syntax.Internal (Dom,Dom'(..), pattern Dom, dIsFinite, dInfo)
 import Agda.Interaction.Options (optUseUnicode, UnicodeOrAscii(..))
 import Agda.TypeChecking.Monad as M hiding (MetaInfo)
 import Agda.Syntax.Scope.Monad (getCurrentModule)
@@ -35,12 +33,13 @@ import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.List
 import Agda.Utils.List1 (List1, pattern (:|))
-import qualified Agda.Utils.List1 as List1
+import Agda.Utils.List1 qualified as List1
 import Agda.Utils.Null
 import Agda.Syntax.Common.Pretty
 import Agda.Utils.Functor
 import Agda.Utils.Singleton
 import Agda.Utils.Size
+import Agda.Utils.Tuple ( (***) )
 
 type Vars = [(Name,R.Type)]
 
@@ -75,7 +74,7 @@ withVar s t f = do
     notTaken xs x = isNoName x || nameConcrete x `notElem` xs
 
 withNames :: MonadReflectedToAbstract m => [String] -> ([Name] -> m a) -> m a
-withNames ss = withVars $ zip ss $ repeat R.Unknown
+withNames = withVars . map (,R.Unknown)
 
 withVars :: MonadReflectedToAbstract m => [(String, R.Type)] -> ([Name] -> m a) -> m a
 withVars ss f = case ss of
@@ -103,9 +102,7 @@ toAbstract_ ::
   (ToAbstract r
   , MonadFresh NameId m
   , MonadError TCErr m
-  , MonadTCEnv m
   , ReadTCState m
-  , HasOptions m
   , HasBuiltins m
   , HasConstInfo m
   ) => r -> m (AbsOfRef r)
@@ -116,15 +113,13 @@ toAbstractWithoutImplicit ::
   (ToAbstract r
   , MonadFresh NameId m
   , MonadError TCErr m
-  , MonadTCEnv m
   , ReadTCState m
-  , HasOptions m
   , HasBuiltins m
   , HasConstInfo m
   ) => r -> m (AbsOfRef r)
 toAbstractWithoutImplicit x = do
-  xs <- killRange <$> getContextNames
-  let ctx = zip xs $ repeat R.Unknown
+  xs <- killRange <$> getContextNames'
+  let ctx = map (,R.Unknown) xs
   runReaderT (toAbstract x) ctx
 
 instance ToAbstract r => ToAbstract (Named name r) where
@@ -140,13 +135,13 @@ instance ToAbstract r => ToAbstract [Arg r] where
 -- instance ToAbstract r A.Expr => ToAbstract (Dom r, Name) (A.TypedBinding) where
 instance (ToAbstract r, AbsOfRef r ~ A.Expr) => ToAbstract (Dom r, Name) where
   type AbsOfRef (Dom r, Name) = A.TypedBinding
-  toAbstract (Dom{domInfo = i, domIsFinite = isfin, unDom = x, domTactic = tac}, name) = do
-    dom <- toAbstract x
+  toAbstract (d, name) = do
+    dom <- toAbstract (unDom d)
     -- TODO(Amy): Anyone know why this discards the tactic? It was like
     -- that when I got here!
     return $ A.TBind noRange
-      (A.TypedBindingInfo Nothing isfin)
-      (singleton $ unnamedArg i $ A.mkBinder_ name)
+      (A.TypedBindingInfo empty (d ^. dIsFinite))
+      (singleton $ unnamedArg (d ^. dInfo) $ A.mkBinder_ name)
       dom
 
 instance ToAbstract (A.Expr, Elim) where
@@ -238,11 +233,6 @@ mkVar i = ifJustM (askVar i) return $ do
 mkVarName :: MonadReflectedToAbstract m => Int -> m Name
 mkVarName i = fst <$> mkVar i
 
-annotatePattern :: MonadReflectedToAbstract m => Int -> R.Type -> A.Pattern -> m A.Pattern
-annotatePattern _ R.Unknown p = return p
-annotatePattern i t p = local (drop $ i + 1) $ do
-  t <- toAbstract t  -- go into the right context for translating the type
-  return $ A.AnnP patNoRange t p
 
 instance ToAbstract Sort where
   type AbsOfRef Sort = A.Expr
@@ -266,12 +256,10 @@ instance ToAbstract R.Pattern where
       return $ A.ConP (ConPatInfo ConOCon patNoRange ConPatEager) (unambiguous $ killRange c) args
     R.DotP t -> A.DotP patNoRange <$> toAbstract t
     R.VarP i -> do
-      (x, t) <- mkVar i
-      annotatePattern i t $ A.VarP $ A.mkBindName x
+      (x, _t) <- mkVar i
+      return $ A.VarP $ A.mkBindName x
     R.LitP l  -> return $ A.LitP patNoRange l
-    R.AbsurdP i -> do
-      (_, t) <- mkVar i
-      annotatePattern i t $ A.AbsurdP patNoRange
+    R.AbsurdP _i -> return $ A.AbsurdP patNoRange
     R.ProjP d -> return $ A.ProjP patNoRange ProjSystem $ unambiguous $ killRange d
 
 instance ToAbstract (QNamed R.Clause) where
@@ -282,12 +270,12 @@ instance ToAbstract (QNamed R.Clause) where
     pats <- toAbstract pats
     rhs  <- toAbstract rhs
     let lhs = spineToLhs $ A.SpineLHS empty name pats
-    return $ A.Clause lhs [] (A.RHS rhs Nothing) A.noWhereDecls False
+    return $ A.Clause lhs [] (A.RHS rhs Nothing) A.noWhereDecls empty
   toAbstract (QNamed name (R.AbsurdClause tel pats)) = withVars (map (Text.unpack *** unArg) tel) $ \_ -> do
     checkClauseTelescopeBindings tel pats
     pats <- toAbstract pats
     let lhs = spineToLhs $ A.SpineLHS empty name pats
-    return $ A.Clause lhs [] A.AbsurdRHS A.noWhereDecls False
+    return $ A.Clause lhs [] A.AbsurdRHS A.noWhereDecls empty
 
 instance ToAbstract [QNamed R.Clause] where
   type AbsOfRef [QNamed R.Clause] = [A.Clause]
@@ -305,10 +293,8 @@ instance ToAbstract (List1 (QNamed R.Clause)) where
 checkClauseTelescopeBindings :: MonadReflectedToAbstract m => [(Text, Arg R.Type)] -> [Arg R.Pattern] -> m ()
 checkClauseTelescopeBindings tel pats =
   case reverse [ x | ((x, _), i) <- zip (reverse tel) [0..], not $ Set.member i bs ] of
-    [] -> return ()
-    xs -> genericDocError $ (singPlural xs id (<> "s") "Missing bindings for telescope variable") <?>
-                              (fsep (punctuate ", " $ map (text . Text.unpack) xs) <> ".") $$
-                             "All variables in the clause telescope must be bound in the left-hand side."
+    []   -> return ()
+    x:xs -> typeError $ MissingBindingsForTelescopeVariables (x :| xs)
   where
     bs = boundVars pats
 

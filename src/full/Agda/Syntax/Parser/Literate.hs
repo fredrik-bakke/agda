@@ -1,13 +1,10 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-{-# LANGUAGE ViewPatterns #-}
-
 -- | Preprocessors for literate code formats.
 
 module Agda.Syntax.Parser.Literate
   ( literateProcessors
-  , literateExtsShortList
-  , literateSrcFile
+  , literateExts
   , literateTeX
   , literateRsT
   , literateMd
@@ -48,7 +45,7 @@ data LayerRole = Markup | Comment | Code
 
 data Layer = Layer
   { layerRole    :: LayerRole
-  , interval     :: Interval
+  , interval     :: IntervalWithoutFile
   , layerContent :: String
   } deriving Show
 
@@ -56,17 +53,17 @@ data Layer = Layer
 
 type Layers = [Layer]
 
-instance HasRange Layer where
-  getRange = getRange . interval
+instance HasRangeWithoutFile Layer where
+  getRangeWithoutFile = getRangeWithoutFile . interval
 
 -- | Annotates a tokenized string with position information.
 
-mkLayers :: Position -> [(LayerRole, String)] -> Layers
+mkLayers :: PositionWithoutFile -> [(LayerRole, String)] -> Layers
 mkLayers pos []            = emptyLiterate pos
 mkLayers pos ((_,"") : xs) = mkLayers pos xs
                              -- Empty layers are ignored.
 mkLayers pos ((ty,s) : xs) =
-  Layer ty (Interval pos next) s : mkLayers next xs
+  Layer ty (Interval () pos next) s : mkLayers next xs
   where
   next = movePosByString pos s
 
@@ -81,34 +78,40 @@ atomizeLayers = (fmap <$> ((,) . fst) <*> snd) <=< unMkLayers
 --
 --   > f : Processor
 --
---   prop> f pos s /= []
+--   proposition> f pos s /= []
 --
---   prop> f pos s >>= layerContent == s
+--   proposition> f pos s >>= layerContent == s
 
-type Processor = Position -> String -> [Layer]
-
-literateSrcFile :: [Layer] -> SrcFile
-literateSrcFile []                    = __IMPOSSIBLE__
-literateSrcFile (Layer{interval} : _) = getIntervalFile interval
+type Processor = PositionWithoutFile -> String -> [Layer]
 
 -- | List of valid extensions for literate Agda files, and their
 --   corresponding preprocessors.
 --
 --   If you add new extensions, remember to update test/Utils.hs so
 --   that test cases ending in the new extensions are found.
+--
+--   The 'Bool' parameter controls whether only @```agda@ blocks
+--   are treated as Agda code in Markdown/Typst files.
+--   When @True@, only blocks marked @```agda@ are considered code.
+--   When @False@, both @```@ and @```agda@ blocks are code (default).
 
-literateProcessors :: [(String, (Processor, FileType))]
-literateProcessors =
+literateProcessors :: Bool -> [(String, (Processor, FileType))]
+literateProcessors onlyAgdaBlocks =
   ((,) <$> (".lagda" ++) . fst <*> snd) <$>
     [ (""    , (literateTeX, TexFileType))
     , (".rst", (literateRsT, RstFileType))
     , (".tex", (literateTeX, TexFileType))
-    , (".md",  (literateMd,  MdFileType ))
+    , (".md",  (literateMd onlyAgdaBlocks,  MdFileType ))
     , (".org", (literateOrg, OrgFileType))
+    , (".tree", (literateTree, TreeFileType))
     -- For now, treat typst as markdown because they use the same
     -- syntax for code blocks.
-    , (".typ", (literateMd,  TypstFileType))
+    , (".typ", (literateMd onlyAgdaBlocks,  TypstFileType))
     ]
+
+-- | List of valid literate file extensions.
+literateExts :: [String]
+literateExts = fst <$> literateProcessors False
 
 -- | Returns @True@ if the role corresponds to Agda code.
 
@@ -143,12 +146,6 @@ bleach = map $ \ c -> if isSpace c && c /= '\t' then c else ' '
 isBlank :: Char -> Bool
 isBlank = (&&) <$> isSpace <*> (/= '\n')
 
--- | Short list of extensions for literate Agda files.
---   For display purposes.
-
-literateExtsShortList :: [String]
-literateExtsShortList = [".lagda"]
-
 -- | Returns a tuple consisting of the first line of the input, and the rest
 --   of the input.
 
@@ -161,8 +158,8 @@ caseLine a k = \case
 
 -- | Canonical decomposition of an empty literate file.
 
-emptyLiterate :: Position -> [Layer]
-emptyLiterate pos = [Layer Markup (Interval pos pos) ""]
+emptyLiterate :: PositionWithoutFile -> [Layer]
+emptyLiterate pos = [Layer Markup (Interval () pos pos) ""]
 
 -- | Create a regular expression that:
 --   - Must match the whole string
@@ -175,7 +172,7 @@ rex s =
 
 -- | Preprocessor for literate TeX.
 
-literateTeX :: Position -> String -> [Layer]
+literateTeX :: Processor
 literateTeX pos s = mkLayers pos (tex s)
   where
   tex :: String -> [(LayerRole, String)]
@@ -200,15 +197,23 @@ literateTeX pos s = mkLayers pos (tex s)
   r_end = rex "([[:blank:]]*)(\\\\end\\{code\\})(.*)"
 
 -- | Preprocessor for Markdown.
+--
+--   The 'Bool' parameter controls whether only @```agda@ blocks
+--   are treated as Agda code.
+--   When @True@, only blocks explicitly marked @```agda@ are considered code.
+--   When @False@, both unmarked @```@ and @```agda@ blocks are code (default).
 
-literateMd :: Position -> String -> [Layer]
-literateMd pos s = mkLayers pos $ md s
+literateMd :: Bool -> Processor
+literateMd onlyAgdaBlocks pos s = mkLayers pos $ md s
   where
   md :: String -> [(LayerRole, String)]
   md = caseLine [] $ \ line rest ->
     case md_begin `matchM` line of
-      Just (getAllTextSubmatches -> [_, pre, markup, _]) ->
-        (Comment, pre) : (Markup, markup) : code rest
+      Just (getAllTextSubmatches -> [_, pre, markup, tag]) ->
+        -- When onlyAgdaBlocks is True, only treat blocks with "agda" tag as code
+        if onlyAgdaBlocks && null tag
+        then (Comment, pre) : (Comment, markup) : code_other rest
+        else (Comment, pre) : (Markup, markup) : code rest
       Just _  -> __IMPOSSIBLE__
       Nothing ->
         (Comment, line) :
@@ -239,7 +244,7 @@ literateMd pos s = mkLayers pos $ md s
 
 -- | Preprocessor for reStructuredText.
 
-literateRsT :: Position -> String -> [Layer]
+literateRsT :: Processor
 literateRsT pos s = mkLayers pos $ rst s
   where
   rst :: String -> [(LayerRole, String)]
@@ -286,7 +291,7 @@ literateRsT pos s = mkLayers pos $ rst s
 
 -- | Preprocessor for Org mode documents.
 
-literateOrg :: Position -> String -> [Layer]
+literateOrg :: Processor
 literateOrg pos s = mkLayers pos $ org s
   where
   org :: String -> [(LayerRole, String)]
@@ -314,3 +319,29 @@ literateOrg pos s = mkLayers pos $ org s
   rex' :: String -> Regex
   -- Source blocks start with `#+begin_src` but the casing does not matter.
   rex' = makeRegexOpts blankCompOpt{newSyntax = True, caseSensitive = False} blankExecOpt
+
+-- | Preprocessor for Forester documents
+
+literateTree :: Processor
+literateTree pos s = mkLayers pos (tree s)
+  where
+  tree :: String -> [(LayerRole, String)]
+  tree = caseLine [] $ \ line rest ->
+    case tree_begin `matchM` line of
+      Just (getAllTextSubmatches -> [_, pre, _, markup, whitespace]) ->
+        (Comment, pre) : (Markup, markup) :
+        (Code, whitespace) : code rest
+      Just _  -> __IMPOSSIBLE__
+      Nothing -> (Comment, line) : tree rest
+
+  tree_begin = rex "(([^\\%]|\\\\.)*)(\\\\agda\\{[^\n]*)(\n)?"
+
+  code :: String -> [(LayerRole, String)]
+  code = caseLine [] $ \ line rest ->
+    case tree_end `matchM` line of
+      Just (getAllTextSubmatches -> [_, code, markup, post]) ->
+        (Code, code) : (Markup, markup) : (Comment, post) : tree rest
+      Just _  -> __IMPOSSIBLE__
+      Nothing -> (Code, line) : code rest
+
+  tree_end = rex "([[:blank:]]*)(\\})(.*)"

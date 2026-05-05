@@ -1,7 +1,6 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
 {-# LANGUAGE ImplicitParams             #-}
-{-# LANGUAGE CPP                        #-}
 
 module Agda.Termination.CallMatrix where
 
@@ -12,9 +11,6 @@ module Agda.Termination.CallMatrix where
 --   , tests
 --   ) where
 
-#if __GLASGOW_HASKELL__ < 804
-import Data.Semigroup
-#endif
 
 import Agda.Termination.CutOff
 import Agda.Termination.Order as Order
@@ -104,6 +100,8 @@ deriving instance NotWorse CallMatrix
 instance HasZero a => Diagonal (CallMatrix' a) a where
   diagonal = diagonal . mat
 
+mapCallMatrix :: (Matrix ArgumentIndex a -> Matrix ArgumentIndex a) -> CallMatrix' a -> CallMatrix' a
+mapCallMatrix f (CallMatrix m) = CallMatrix (f m)
 
 -- | Call matrix multiplication and call combination.
 
@@ -167,6 +165,9 @@ instance Monoid cinfo => CallComb (CallMatrixAug cinfo) where
 noAug :: Monoid cinfo => CallMatrix -> CallMatrixAug cinfo
 noAug m = CallMatrixAug m mempty
 
+mapCallMatrixAug :: (CallMatrix -> CallMatrix) -> CallMatrixAug cinfo -> CallMatrixAug cinfo
+mapCallMatrixAug f (CallMatrixAug m i) = CallMatrixAug (f m) i
+
 ------------------------------------------------------------------------
 -- * Sets of incomparable call matrices augmented with path information.
 ------------------------------------------------------------------------
@@ -175,6 +176,10 @@ noAug m = CallMatrixAug m mempty
 --   Use overloaded 'null', 'empty', 'singleton', 'mappend'.
 newtype CMSet cinfo = CMSet { cmSet :: Favorites (CallMatrixAug cinfo) }
   deriving ( Show, Semigroup, Monoid, Null, Singleton (CallMatrixAug cinfo) )
+
+mapCMSet :: (Favorites (CallMatrixAug cinfo) -> Favorites (CallMatrixAug cinfo))
+  -> CMSet cinfo -> CMSet cinfo
+mapCMSet f (CMSet s) = CMSet (f s)
 
 -- | Call matrix set product is the Cartesian product.
 

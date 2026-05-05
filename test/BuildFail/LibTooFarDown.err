@@ -1,0 +1,3 @@
+../BuildFail/LibTooFarDown/A.agda:1.1: error: [LibTooFarDown]
+An .agda-lib file for Some.Hierarchical.Module.Name
+must not be located in the directory ../BuildFail/LibTooFarDown

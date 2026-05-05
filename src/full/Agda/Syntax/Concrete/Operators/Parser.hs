@@ -1,6 +1,7 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
+{-# OPTIONS_GHC -Wunused-binds #-}
 
-{-# LANGUAGE GADTs        #-}
 {-# LANGUAGE DataKinds    #-}
 
 module Agda.Syntax.Concrete.Operators.Parser where
@@ -8,13 +9,10 @@ module Agda.Syntax.Concrete.Operators.Parser where
 import Control.Applicative ( Alternative((<|>), many) )
 import Control.Monad ((<=<))
 
-import Data.Either
 import Data.Function (on)
 import Data.Kind ( Type )
 import qualified Data.List as List
-import Data.Maybe
 import qualified Data.Strict.Maybe as Strict
-import Data.Set (Set)
 
 import Agda.Syntax.Position
 import qualified Agda.Syntax.Abstract.Name as A
@@ -25,9 +23,10 @@ import Agda.Syntax.Concrete.Operators.Parser.Monad hiding (parse)
 import qualified Agda.Syntax.Concrete.Operators.Parser.Monad as P
 
 import Agda.Syntax.Common.Pretty
-import Agda.Utils.List  ( spanEnd )
+import Agda.Utils.List
 import Agda.Utils.List1 ( List1, pattern (:|), (<|) )
 import qualified Agda.Utils.List1 as List1
+import Agda.Utils.Set1  ( Set1 )
 import Agda.Utils.Singleton
 
 import Agda.Utils.Impossible
@@ -57,7 +56,7 @@ data ExprView e
     | WildV e
     | OtherV e
     | AppV e (NamedArg e)
-    | OpAppV QName (Set A.Name) (OpAppArgs' e)
+    | OpAppV QName (Set1 A.Name) (OpAppArgs' e)
       -- ^ The 'QName' is possibly ambiguous, but it must correspond
       -- to one of the names in the set.
     | HiddenArgV (Named_ e)
@@ -78,7 +77,7 @@ instance IsExpr Expr where
     exprView = \case
         Ident x         -> LocalV x
         App _ e1 e2     -> AppV e1 e2
-        OpApp r d ns es -> OpAppV d ns es
+        OpApp _ d ns es -> OpAppV d ns es
         HiddenArg _ e   -> HiddenArgV e
         InstanceArg _ e -> InstanceArgV e
         Paren _ e       -> ParenV e
@@ -103,7 +102,7 @@ instance IsExpr Pattern where
         IdentP True x    -> LocalV x
         IdentP False _   -> __IMPOSSIBLE__
         AppP e1 e2       -> AppV e1 e2
-        OpAppP r d ns es -> OpAppV d ns $ (fmap . fmap . fmap) (noPlaceholder . Ordinary) es
+        OpAppP _ d ns es -> OpAppV d ns $ (fmap . fmap . fmap) (noPlaceholder . Ordinary) es
         HiddenP _ e      -> HiddenArgV e
         InstanceP _ e    -> InstanceArgV e
         ParenP _ e       -> ParenV e
@@ -112,7 +111,7 @@ instance IsExpr Pattern where
     unExprView = \case
         LocalV x       -> IdentP True x
         AppV e1 e2     -> AppP e1 e2
-        OpAppV d ns es -> let ess :: [NamedArg Pattern]
+        OpAppV d ns es -> let ess :: List1 (NamedArg Pattern)
                               ess = (fmap . fmap . fmap)
                                       (\case
                                           Placeholder{}     -> __IMPOSSIBLE__
@@ -254,8 +253,8 @@ opP parseSections p (NewNotation q names _ syn isOp) kind =
   flip fmap (worker (List1.init $ qnameParts q)
                     withoutExternalHoles) $ \(range, hs) ->
 
-  let (normal, binders) = partitionEithers hs
-      lastHole          = maximum $ (-1) : mapMaybe holeTarget syn
+  let (normal, binders) = partitionEithers' hs
+      lastHole          = maximum $ ((-1) :) $ mapMaybe' holeTarget syn
 
       app :: ([(MaybePlaceholder e, NamedArg (Ranged Int))] ->
               [(MaybePlaceholder e, NamedArg (Ranged Int))]) -> e
@@ -268,15 +267,17 @@ opP parseSections p (NewNotation q names _ syn isOp) kind =
           -- away here.
           unExprView (LocalV q')
         else
-          unExprView (OpAppV q' names args)
+          List1.ifNull args
+            {-then-} (unExprView $ LocalV q')
+            {-else-} $ unExprView . OpAppV q' names
         where
         args = map (findExprFor (f normal) binders) [0..lastHole]
         q'   = setRange range q
   in
 
   case kind of
-    In   -> \x y -> app (\es -> (x, leadingHole) : es ++ [(y, trailingHole)])
-    Pre  -> \  y -> app (\es ->                    es ++ [(y, trailingHole)])
+    In   -> \x y -> app (\es -> (x, leadingHole) : es ++! [(y, trailingHole)])
+    Pre  -> \  y -> app (\es ->                    es ++! [(y, trailingHole)])
     Post -> \x   -> app (\es -> (x, leadingHole) : es)
     Non  ->         app (\es ->                    es)
 
@@ -297,7 +298,7 @@ opP parseSections p (NewNotation q names _ syn isOp) kind =
     [Name] -> Notation ->
     Parser e (Range, [Either (MaybePlaceholder e, NamedArg (Ranged Int))
                              (LamBinding, Ranged BoundVariablePosition)])
-  worker ms []              = pure (noRange, [])
+  worker _  []              = pure (noRange, [])
   worker ms (IdPart x : xs) =
     (\r1 (r2, es) -> (fuseRanges r1 r2, es))
       <$> partP ms (rangedThing x)
@@ -312,16 +313,19 @@ opP parseSections p (NewNotation q names _ syn isOp) kind =
       <*> worker ms xs
   worker ms (WildPart h : xs) =
     (\(r, es) -> let anon = mkBinder_ simpleHole
-                 in (r, Right (mkBinding h anon) : es))
+                     !e = Right $! mkBinding h anon
+                 in (r, e : es))
       <$> worker ms xs
   worker ms (VarPart _ h : xs) = do
-    (\ b (r, es) -> (r, Right (mkBinding h b) : es))
+    (\ b (r, es) ->
+       let !e = Right $! mkBinding h b
+       in (r,  e : es))
            -- Andreas, 2011-04-07 put just 'Relevant' here, is this
            -- correct?
       <$> patternBinder
       <*> worker ms xs
 
-  mkBinding h b = (DomainFree $ defaultNamedArg b, h)
+  mkBinding h b = ((,) $! DomainFree $ defaultNamedArg b) h
 
   set x arg = fmap (fmap (const x)) arg
 
@@ -334,7 +338,7 @@ opP parseSections p (NewNotation q names _ syn isOp) kind =
       [(Placeholder p,     arg)] -> set (Placeholder p) arg
       [(NoPlaceholder _ e, arg)] ->
         List1.ifNull
-          (map snd $
+          (map' snd $
            List.sortBy (compare `on` fst)
              [ (varNumber (rangedThing m), b)
              | (b, m) <- binders
@@ -344,8 +348,8 @@ opP parseSections p (NewNotation q names _ syn isOp) kind =
         {-else-} $ \ bs -> set (noPlaceholder (SyntaxBindingLambda (fuseRange bs e) bs e)) arg
       _ -> __IMPOSSIBLE__
 
-  noPlaceholders :: OpAppArgs' e -> Int
-  noPlaceholders = sum . fmap (isPlaceholder . namedArg)
+  noPlaceholders :: OpAppArgs0 e -> Int
+  noPlaceholders = sum . map (isPlaceholder . namedArg)
     where
     isPlaceholder NoPlaceholder{} = 0
     isPlaceholder Placeholder{}   = 1
@@ -359,7 +363,7 @@ argsP p = many (mkArg <$> p)
     _              -> defaultArg (unnamed e)
 
 appP :: IsExpr e => Parser e e -> Parser e [NamedArg e] -> Parser e e
-appP p pa = foldl app <$> p <*> pa
+appP p pa = List.foldl' app <$> p <*> pa
     where
         app e = unExprView . AppV e
 

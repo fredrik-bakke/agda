@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP  #-}
 {-# LANGUAGE UndecidableInstances  #-} -- Due MonadReader/MonadState fundep
 
 -- | @ListT@ done right,
@@ -12,14 +11,9 @@ module Agda.Utils.ListT where
 
 import Control.Applicative ( Alternative((<|>), empty) )
 import Control.Monad
-import Control.Monad.Fail as Fail
 import Control.Monad.Reader
 import Control.Monad.State
 import Control.Monad.IO.Class ( MonadIO(..) )
-
-#if !(MIN_VERSION_base(4,11,0))
-import Data.Semigroup (Semigroup(..))
-#endif
 
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
@@ -123,20 +117,17 @@ instance Monad m => Semigroup (ListT m a) where
   l1 <> l2 = ListT $ foldListT (unmapListT . consListT) (runListT l2) l1
 
 instance Monad m => Monoid (ListT m a) where
-  mempty        = nilListT
-#if !(MIN_VERSION_base(4,11,0))
-  mappend = (<>)
-#endif
+  mempty = nilListT
 
-instance (Functor m, Applicative m, Monad m) => Alternative (ListT m) where
+instance (Monad m) => Alternative (ListT m) where
   empty = mempty
   (<|>) = mappend
 
-instance (Functor m, Applicative m, Monad m) => MonadPlus (ListT m) where
+instance (Monad m) => MonadPlus (ListT m) where
   mzero = mempty
   mplus = mappend
 
-instance (Functor m, Applicative m, Monad m) => Applicative (ListT m) where
+instance (Monad m) => Applicative (ListT m) where
   pure  = sgListT
   (<*>) = ap
 
@@ -146,21 +137,21 @@ instance (Functor m, Applicative m, Monad m) => Applicative (ListT m) where
   --   loop (Just (f, l1')) (Just (a, l2')) = Just (f a, l1' <*> l2')
   --   loop _ _ = Nothing
 
-instance (Functor m, Applicative m, Monad m) => Monad (ListT m) where
+instance (Monad m) => Monad (ListT m) where
   return  = pure
   l >>= k = concatListT $ k <$> l
 
 instance MonadTrans ListT where
   lift = sgMListT
 
-instance (Applicative m, MonadIO m) => MonadIO (ListT m) where
+instance (MonadIO m) => MonadIO (ListT m) where
   liftIO = lift . liftIO
 
-instance (Applicative m, MonadReader r m) => MonadReader r (ListT m) where
+instance (MonadReader r m) => MonadReader r (ListT m) where
   ask     = lift ask
   local   = mapListT . local
 
-instance (Applicative m, MonadState s m) => MonadState s (ListT m) where
+instance (MonadState s m) => MonadState s (ListT m) where
   get = lift get
   put = lift . put
 

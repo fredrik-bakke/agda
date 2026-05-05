@@ -1,4 +1,4 @@
-{-# OPTIONS --erased-cubical --safe --no-sized-types --no-guardedness #-}
+{-# OPTIONS --cubical=no-glue --safe --no-sized-types --no-guardedness #-}
 
 module Agda.Builtin.Cubical.Sub where
 
@@ -11,7 +11,7 @@ module Agda.Builtin.Cubical.Sub where
 
   {-# BUILTIN SUBIN inS #-}
 
-  -- Sub A φ u is treated as A.
+  -- Sub A φ u is treated as A.
   {-# COMPILE JS inS = _ => _ => _ => x => x #-}
 
   primitive

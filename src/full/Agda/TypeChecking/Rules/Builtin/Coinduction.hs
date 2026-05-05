@@ -6,6 +6,8 @@
 
 module Agda.TypeChecking.Rules.Builtin.Coinduction where
 
+import Prelude hiding (null)
+
 import Agda.Interaction.Options.Base
 
 import qualified Agda.Syntax.Abstract as A
@@ -24,7 +26,7 @@ import Agda.TypeChecking.Telescope
 import Agda.TypeChecking.Rules.Builtin
 import Agda.TypeChecking.Rules.Term
 
-import Agda.Utils.Lens
+import Agda.Utils.Null
 
 -- | The type of @∞@.
 
@@ -84,7 +86,8 @@ bindBuiltinSharp x =
                   , recNamedCon       = True
                   , recFields         = []  -- flat is added later
                   , recTel            = fieldTel
-                  , recEtaEquality'   = Inferred $ NoEta CopatternMatching
+                  , recPositivityCheck = NoPositivityCheck
+                  , recEtaEquality'   = EtaEquality (NoEta CopatternMatching) EtaFromPragma
                   , recPatternMatching= CopatternMatching
                   , recMutual         = Just []
                   , recTerminates     = Just True  -- not recursive
@@ -138,17 +141,16 @@ bindBuiltinFlat x =
           , clauseFullRange = noRange
           , clauseTel       = tel
           , namedClausePats = [ argN $ Named Nothing $
-              ConP sharpCon cpi [ argN $ Named Nothing $ debruijnNamedVar "x" 0 ] ]
+              ConP sharpCon cpi [ argN $ Named Nothing $ deBruijnNamedVar "x" 0 ] ]
           , clauseBody      = Just $ var 0
           , clauseType      = Just $ defaultArg $ El (varSort 2) $ var 1
-          , clauseCatchall    = False
-          , clauseExact       = Just True
-          , clauseRecursive   = Just False
+          , clauseCatchall    = empty
+          , clauseRecursive   = NotRecursive
           , clauseUnreachable = Just False
           , clauseEllipsis    = NoEllipsis
           , clauseWhereModule = Nothing
           }
-        cc = Case (defaultArg 0) $ conCase sharp False $ WithArity 1 $ Done [defaultArg "x"] $ var 0
+        cc = Case (defaultArg 0) $ conCase sharp False $ WithArity 1 $ Done 0 NotRecursive [defaultArg "x"] $ var 0
         projection = Projection
           { projProper   = Just inf
           , projOrig     = flat
@@ -160,7 +162,7 @@ bindBuiltinFlat x =
     addConstant flat $
       flatDefn { defPolarity       = []
                , defArgOccurrences = [StrictPos]  -- changing that to [Mixed] destroys monotonicity of 'Rec' in test/succeed/GuardednessPreservingTypeConstructors
-               , defCopatternLHS = hasProjectionPatterns cc
+               , defCopatternLHS' = hasProjectionPatterns cc
                , theDef = FunctionDefn fun
                    { _funClauses      = [clause]
                    , _funCompiled     = Just $ cc

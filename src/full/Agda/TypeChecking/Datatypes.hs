@@ -16,7 +16,9 @@ import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Pretty
 
+import Agda.Utils.CallStack
 import Agda.Utils.Either
+import Agda.Utils.Functor
 import Agda.Syntax.Common.Pretty ( prettyShow )
 import Agda.Utils.Size
 
@@ -27,7 +29,7 @@ import Agda.Utils.Impossible
 ---------------------------------------------------------------------------
 
 -- | Get true constructor with record fields.
-getConHead :: (HasConstInfo m) => QName -> m (Either SigError ConHead)
+getConHead :: (HasCallStack, HasConstInfo m) => QName -> m (Either SigError ConHead)
 getConHead c = runExceptT $ do
   def <- ExceptT $ getConstInfo' c
   case theDef def of
@@ -35,25 +37,28 @@ getConHead c = runExceptT $ do
     Record     { recConHead = c' } -> return c'
     _ -> throwError $ SigUnknown $ prettyShow c ++ " is not a constructor"
 
-isConstructor :: (HasConstInfo m) => QName -> m Bool
+isConstructor :: (HasCallStack, HasConstInfo m) => QName -> m Bool
 isConstructor q = isRight <$> getConHead q
 
 -- | Get true constructor with fields, expanding literals to constructors
 --   if possible.
-getConForm :: QName -> TCM (Either SigError ConHead)
+getConForm :: HasCallStack => QName -> TCM (Either SigError ConHead)
 getConForm c = caseEitherM (getConHead c) (return . Left) $ \ ch -> do
   Con con _ [] <- constructorForm (Con ch ConOCon [])
   return $ Right con
 
 -- | Augment constructor with record fields (preserve constructor name).
 --   The true constructor might only surface via 'reduce'.
-getOrigConHead :: QName -> TCM (Either SigError ConHead)
-getOrigConHead c = mapRight (setConName c) <$> getConHead c
+getOrigConHead :: HasCallStack => QName -> TCM ConHead
+getOrigConHead c = setConName c <$> do
+  fromRightM
+    (sigError c (typeError $ AbstractConstructorNotInScope c)) $
+    getConHead c
 
 -- | Get the name of the datatype constructed by a given constructor.
 --   Precondition: The argument must refer to a constructor
 {-# SPECIALIZE getConstructorData :: QName -> TCM QName #-}
-getConstructorData :: HasConstInfo m => QName -> m QName
+getConstructorData :: (HasCallStack, HasConstInfo m) => QName -> m QName
 getConstructorData c = do
   def <- getConstInfo c
   case theDef def of
@@ -62,7 +67,7 @@ getConstructorData c = do
 
 -- | Is the datatype of this constructor a Higher Inductive Type?
 --   Precondition: The argument must refer to a constructor of a datatype or record.
-consOfHIT :: HasConstInfo m => QName -> m Bool
+consOfHIT :: (HasCallStack, HasConstInfo m) => QName -> m Bool
 consOfHIT c = do
   d <- getConstructorData c
   def <- theDef <$> getConstInfo d
@@ -71,7 +76,7 @@ consOfHIT c = do
     Record{} -> return False
     _  -> __IMPOSSIBLE__
 
-isPathCons :: HasConstInfo m => QName -> m Bool
+isPathCons :: (HasCallStack, HasConstInfo m) => QName -> m Bool
 isPathCons c = do
   d <- getConstructorData c
   def <- theDef <$> getConstInfo d
@@ -113,7 +118,7 @@ getFullyAppliedConType c t = do
       reportSLn "tc.getConType" 35 $ unwords $
         [ "getFullyAppliedConType: case Def", prettyShow d, prettyShow es ]
       dt <- defType <$> getConstInfo d
-      let pars = fromMaybe __IMPOSSIBLE__ $ allApplyElims $ take npars es
+      let pars = mustAllApplyElims $ take npars es
       ctPars <- ctype `piApplyM` pars
       return $ Just ((d, dt, pars), ctPars)
     _ -> return Nothing
@@ -135,7 +140,7 @@ fullyApplyCon
        --   type of the full application.
   -> m a
 fullyApplyCon c vs t ret = fullyApplyCon' c vs t ret $
-  typeError . DoesNotConstructAnElementOf (conName c)
+  typeError . ConstructorDoesNotTargetGivenType (conName c)
 
 -- | Like @fullyApplyCon@, but calls the given fallback function if
 --   it encounters something other than a datatype.
@@ -156,7 +161,7 @@ fullyApplyCon' c vs t0 ret err = do
     , " at type "
     , prettyTCM t0
     ]
-  (TelV tel t, boundary) <- telViewPathBoundaryP t0
+  (TelV tel t, boundary) <- telViewPathBoundary t0
   -- The type of the constructor application may still be a function
   -- type.  In this case, we introduce the domains @tel@ into the context
   -- and apply the constructor to these fresh variables.
@@ -217,18 +222,18 @@ data ConstructorInfo
 -- | Return the number of non-parameter arguments to a constructor (arity).
 --   In case of record constructors, also return the field names (plus other info).
 --
-getConstructorInfo :: HasConstInfo m => QName -> m ConstructorInfo
+getConstructorInfo :: (HasCallStack, HasConstInfo m) => QName -> m ConstructorInfo
 getConstructorInfo c = fromMaybe __IMPOSSIBLE__ <$> getConstructorInfo' c
 
-getConstructorInfo' :: HasConstInfo m => QName -> m (Maybe ConstructorInfo)
+getConstructorInfo' :: (HasCallStack, HasConstInfo m) => QName -> m (Maybe ConstructorInfo)
 getConstructorInfo' c = do
-  (theDef <$> getConstInfo c) >>= \case
+  getConstInfo c <&> theDef >>= \case
     Constructor{ conData = d, conArity = n } -> Just <$> do
-      (theDef <$> getConstInfo d) >>= \case
-        r@Record{ recFields = fs } ->
-           return $ RecordCon (recPatternMatching r) (recEtaEquality r) n fs
-        Datatype{} ->
-           return $ DataCon n
+      getConstInfo d <&> theDef <&> \case
+        RecordDefn (r@RecordData{ _recFields = fs, _recPatternMatching = pat }) ->
+          RecordCon pat (_recEtaEquality r) n fs
+        DatatypeDefn _ ->
+          DataCon n
         _ -> __IMPOSSIBLE__
     _ -> return Nothing
 
@@ -249,17 +254,23 @@ isDatatype d = do
 isDataOrRecordType :: QName -> TCM (Maybe DataOrRecord)
 isDataOrRecordType d = do
   (theDef <$> getConstInfo d) >>= \case
-    Record{ recPatternMatching } -> return $ Just $ IsRecord recPatternMatching
+    Record{ recEtaEquality', recPatternMatching } -> return $ Just $ IsRecord $
+      case recPatternMatching of
+        -- If the user explicitly asked for @pattern@, pattern matching is allowed.
+        p@PatternMatching -> p
+        -- Otherwise, 'recEtaEquality' might allow pattern matching.
+        CopatternMatching ->
+          if patternMatchingAllowed recEtaEquality' then PatternMatching else CopatternMatching
     Datatype{} -> return $ Just IsData
     _          -> return $ Nothing
 
 -- | Precodition: 'Term' is 'reduce'd.
-isDataOrRecord :: Term -> TCM (Maybe QName)
+isDataOrRecord :: Term -> TCM (Maybe (QName, DataOrRecord))
 isDataOrRecord = \case
-    Def d _ -> fmap (const d) <$> isDataOrRecordType d
+    Def d _ -> fmap (d,) <$> isDataOrRecordType d
     _       -> return Nothing
 
-getNumberOfParameters :: HasConstInfo m => QName -> m (Maybe Nat)
+getNumberOfParameters :: (HasCallStack, HasConstInfo m) => QName -> m (Maybe Nat)
 getNumberOfParameters d = do
   def <- getConstInfo d
   case theDef def of
@@ -270,7 +281,7 @@ getNumberOfParameters d = do
 
 -- | This is a simplified version of @isDatatype@ from @Coverage@,
 --   useful when we do not want to import the module.
-getDatatypeArgs :: HasConstInfo m => Type -> m (Maybe (QName, Args, Args))
+getDatatypeArgs :: (HasCallStack, HasConstInfo m) => Type -> m (Maybe (QName, Args, Args))
 getDatatypeArgs t = do
   case unEl t of
     Def d es -> do
@@ -287,9 +298,7 @@ getDatatypeArgs t = do
 
 getNotErasedConstructors :: QName -> TCM [QName]
 getNotErasedConstructors d = do
-  cs <- getConstructors d
-  flip filterM cs $ \ c -> do
-    usableModality <$> getConstInfo c
+  filterM (usableModality <.> getConstInfo) =<< getConstructors d
 
 -- | Precondition: Name is a data or record type.
 getConstructors :: QName -> TCM [QName]

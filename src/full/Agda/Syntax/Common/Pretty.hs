@@ -1,15 +1,17 @@
+{-# OPTIONS_GHC -Wunused-imports #-}
 
 {-| Pretty printing functions.
 -}
 module Agda.Syntax.Common.Pretty
     ( module Agda.Syntax.Common.Pretty
     , module Text.PrettyPrint.Annotated
-    -- This re-export can be removed once <GHC-8.4 is dropped.
-    , module Data.Semigroup
     ) where
 
 import Prelude hiding (null)
 
+import Control.DeepSeq
+
+import qualified Data.List as List
 import qualified Data.Foldable as Fold
 import qualified Data.IntSet as IntSet
 import qualified Data.IntMap as IntMap
@@ -18,8 +20,9 @@ import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Data.IntSet (IntSet)
 import Data.IntMap (IntMap)
-import Data.Word (Word64)
+import Data.Word (Word64, Word32)
 import Data.Text (Text)
+import Data.Text qualified as Text
 import Data.Int (Int32)
 import Data.Map (Map)
 import Data.Set (Set)
@@ -32,19 +35,24 @@ import Text.PrettyPrint.Annotated hiding
 
   , semi, comma, colon, space, equals, lparen, rparen, lbrack, rbrack
   , lbrace, rbrace
+  , annotate
   )
 
-import Data.Semigroup ((<>))
+import Agda.Syntax.Common.Aspect
+import Agda.Syntax.Position
 
+import Agda.Utils.DocTree qualified as DocTree
+import Agda.Utils.FileName
 import Agda.Utils.Float
 import Agda.Utils.List1 (List1)
 import qualified Agda.Utils.List1 as List1
+import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.Null
 import Agda.Utils.Size
 
-import Agda.Syntax.Common.Aspect
-import Agda.Utils.Impossible
+type DocTree = DocTree.DocTree Aspects
 
+---------------------------------------------------------------------------
 -- * Pretty class
 
 -- | The type of documents. We use documents annotated by 'Aspects' to
@@ -68,17 +76,21 @@ class Pretty a where
   prettyPrec  = const pretty
   prettyList  = brackets . prettyList_
 
+  {-# MINIMAL pretty | prettyPrec #-}
+
 -- | Use instead of 'show' when printing to world.
 
 prettyShow :: Pretty a => a -> String
 prettyShow = render . pretty
 
+---------------------------------------------------------------------------
 -- * Pretty instances
 
 instance Pretty Bool    where pretty = text . show
 instance Pretty Int     where pretty = text . show
 instance Pretty Int32   where pretty = text . show
 instance Pretty Integer where pretty = text . show
+instance Pretty Word32  where pretty = text . show
 instance Pretty Word64  where pretty = text . show
 instance Pretty Double  where pretty = text . toStringWithoutDotZero
 instance Pretty Text    where pretty = text . T.unpack
@@ -94,12 +106,22 @@ instance Pretty Char where
 instance a ~ Aspects => Pretty (P.Doc a) where
   pretty = id
 
+instance a ~ Aspects => Pretty (DocTree.DocTree a) where
+  pretty = DocTree.prettyDocTree
+
 instance Pretty () where
   pretty _ = P.empty
 
+instance (Pretty a, Pretty b) => Pretty (a, b) where
+    pretty (a, b) = parens $ (pretty a <> comma) <+> pretty b
+
 instance Pretty a => Pretty (Maybe a) where
-  prettyPrec p Nothing  = "(nothing)"
+  prettyPrec p Nothing  = P.empty
   prettyPrec p (Just x) = prettyPrec p x
+
+instance Pretty a => Pretty (Strict.Maybe a) where
+  prettyPrec p Strict.Nothing  = P.empty
+  prettyPrec p (Strict.Just x) = prettyPrec p x
 
 instance Pretty a => Pretty [a] where
   pretty = prettyList
@@ -119,6 +141,54 @@ instance Pretty a => Pretty (IntMap a) where
 instance (Pretty k, Pretty v) => Pretty (Map k v) where
   pretty = prettyMap . Map.toList
 
+-- Pretty instances for dependencies of this module (to avoid dependency cycles)
+
+instance Pretty AbsolutePath where
+  pretty = text . filePath
+
+instance Pretty RangeFile where
+  pretty = pretty . rangeFilePath
+
+prettyLineColumn :: Position' a -> Doc
+prettyLineColumn (Pn _ _ l c) = pretty l <> dot <> pretty c
+
+instance Pretty a => Pretty (Position' (Strict.Maybe a)) where
+  pretty p = case srcFile p of
+    Strict.Nothing -> prettyLineColumn p
+    Strict.Just f  -> pretty f <> colon <> prettyLineColumn p
+
+instance Pretty PositionWithoutFile where
+  pretty = prettyLineColumn
+
+prettyInterval :: Eq a => Position' a -> Position' a -> Doc
+prettyInterval s e
+    | s == e    = start
+    | otherwise = start <> "-" <> end
+    where
+      sl = posLine s
+      el = posLine e
+      sc = posCol s
+      ec = posCol e
+
+      start :: Doc
+      start = pretty sl <> dot <> pretty sc
+
+      end :: Doc
+        | sl == el  = pretty ec
+        | otherwise = pretty el <> dot <> pretty ec
+
+instance Pretty a => Pretty (Interval' a) where
+  pretty :: Interval' a -> Doc
+  pretty i@(Interval f s e) = applyUnlessNull (pretty f) (\ d -> ((d <> colon) <>)) (prettyInterval s e)
+
+instance Pretty a => Pretty (Range' a) where
+  pretty r = maybe empty pretty (rangeToIntervalWithFile r)
+
+instance (Pretty a, HasRange a) => Pretty (PrintRange a) where
+  pretty (PrintRange a) = pretty a <+> parens ("at" <+> pretty (getRange a))
+
+
+---------------------------------------------------------------------------
 -- * Generalizing the original type from list to Foldable
 
 sep, fsep, hsep, hcat, vcat :: Foldable t => t Doc -> Doc
@@ -131,7 +201,14 @@ vcat = P.vcat . Fold.toList
 punctuate :: Foldable t => Doc -> t Doc -> [Doc]
 punctuate d = P.punctuate d . Fold.toList
 
+---------------------------------------------------------------------------
 -- * 'Doc' utilities
+
+vsep :: [Doc] -> Doc
+vsep = vcat . List.intersperse ""
+
+twords :: Text -> [Doc]
+twords = map pretty . Text.words
 
 pwords :: String -> [Doc]
 pwords = map text . words
@@ -176,6 +253,12 @@ mparens False = id
 parensNonEmpty :: Doc -> Doc
 parensNonEmpty d = if null d then empty else parens d
 
+-- | Return 'empty' for empty strings.
+textNonEmpty :: String -> Doc
+textNonEmpty = \case
+  "" -> empty
+  s  -> text s
+
 -- | @align max rows@ lays out the elements of @rows@ in two columns,
 -- with the second components aligned. The alignment column of the
 -- second components is at most @max@ characters to the right of the
@@ -204,12 +287,24 @@ pshow = text . show
 singPlural :: Sized a => a -> c -> c -> c
 singPlural xs singular plural = if natSize xs == 1 then singular else plural
 
+pluralS :: Sized a => a -> Doc -> Doc
+pluralS xs d = singPlural xs d (d <> "s")
+
 -- | Used for with-like 'telescopes'
 
 prefixedThings :: Doc -> [Doc] -> Doc
 prefixedThings kw = \case
   []           -> P.empty
   (doc : docs) -> fsep $ (kw <+> doc) : map (hlSymbol "|" <+>) docs
+
+---------------------------------------------------------------------------
+-- * Annotations
+
+-- | Only adds an annotation node if the 'Aspects' is non-'null'.
+annotate :: Aspects -> Doc -> Doc
+annotate a x
+  | null a    = x
+  | otherwise = rnf a `seq` P.annotate a x
 
 -- | Attach a simple 'Aspect', rather than a full set of 'Aspects', to a
 -- document.
@@ -223,7 +318,25 @@ annotateAspect a = annotate a' where
     , tokenBased     = TokenBased
     }
 
--- * Syntax highlighting helpers
+-- * Hyperlink annotations
+
+-- | Attach a link to a document (cf. LaTeX @\href@).
+href :: Text -> Doc -> Doc
+href = annotateAspect . URL
+
+-- | A URL formatted as link (cf. LaTeX @\url@).
+url :: String -> Doc
+url s = href (Text.pack s) (text s)
+
+-- | Link to an issue on the Agda bug tracker.
+githubIssue :: Int -> Doc
+githubIssue = url . ("https://github.com/agda/agda/issues/" ++) . show
+
+-- | Attach the position of something as the "binding site" of a 'Doc'.
+definedAt :: HasRange a => Doc -> a -> Doc
+definedAt doc p = annotate (rangeDefinitionSite p) doc
+
+-- ** Basic syntax highlighting helpers
 
 hlComment, hlSymbol, hlKeyword, hlString, hlNumber, hlHole, hlPrimitiveType, hlPragma
   :: Doc -> Doc
@@ -237,6 +350,31 @@ hlHole          = annotateAspect Hole
 hlPrimitiveType = annotateAspect PrimitiveType
 hlPragma        = annotateAspect Pragma
 
+-- ** Helpers introducing 'NameKind's
+
+hlNameKind :: NameKind -> Doc -> Doc
+hlNameKind k = annotateAspect (Name (Just k) False)
+
+hlBound, hlGeneralizable, hlDatatype, hlField,
+  hlFunction, hlModule, hlPostulate, hlPrimitive, hlRecord, hlArgument,
+  hlMacro :: Doc -> Doc
+
+hlBound         = hlNameKind Bound
+hlGeneralizable = hlNameKind Generalizable
+hlDatatype      = hlNameKind Datatype
+hlField         = hlNameKind Field
+hlFunction      = hlNameKind Function
+hlModule        = hlNameKind Module
+hlPostulate     = hlNameKind Postulate
+hlPrimitive     = hlNameKind Primitive
+hlRecord        = hlNameKind Record
+hlArgument      = hlNameKind Argument
+hlMacro         = hlNameKind Macro
+
+hlConstructor :: Induction -> Doc -> Doc
+hlConstructor = hlNameKind . Constructor
+
+---------------------------------------------------------------------------
 -- * Delimiter wrappers
 --
 -- These use the 'Symbol' highlight for the punctuation characters.
@@ -252,11 +390,12 @@ parens p       = lparen <> p <> rparen
 brackets p     = lbrack <> p <> rbrack
 braces p       = lbrace <> p <> rbrace
 
-semi, comma, colon, space, equals, lparen, rparen, lbrack, rbrack, lbrace, rbrace :: Doc
+semi, comma, colon, dot, pipe, equals, lparen, rparen, lbrack, rbrack, lbrace, rbrace :: Doc
 semi   = hlSymbol $ char ';'
 comma  = hlSymbol $ char ','
 colon  = hlSymbol $ char ':'
-space  = hlSymbol $ char ' '
+dot    = hlSymbol $ char '.'
+pipe   = hlSymbol $ char '|'
 equals = hlSymbol $ char '='
 lparen = hlSymbol $ char '('
 rparen = hlSymbol $ char ')'

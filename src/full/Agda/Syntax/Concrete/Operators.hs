@@ -1,7 +1,7 @@
-{-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
+{-# OPTIONS_GHC -Wunused-binds #-}
 
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE DataKinds #-}
 
 {-| The parser doesn't know about operators and parses everything as normal
     function application. This module contains the functions that parses the
@@ -14,25 +14,28 @@
 
 module Agda.Syntax.Concrete.Operators
     ( parseApplication
-    , parseModuleApplication
+    , parseArguments
     , parseLHS
     , parsePattern
     , parsePatternSyn
     ) where
 
-import Control.Applicative ( Alternative((<|>)))
+import Prelude hiding (null)
+
+import Control.Applicative ( Alternative( (<|>) ) )
 import Control.Monad.Except (throwError)
+import Control.Monad ((<$!>))
 
 import Data.Either (partitionEithers)
-import qualified Data.Foldable as Fold
-import Data.Function (on)
 import qualified Data.Function
+import Data.Foldable
 import qualified Data.List as List
 import Data.Maybe
 import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.Traversable as Trav
 
+import Agda.Syntax.Abstract.Name (KindOfName(..))
 import Agda.Syntax.Common
 import Agda.Syntax.Concrete hiding (appView)
 import Agda.Syntax.Concrete.Operators.Parser
@@ -41,7 +44,7 @@ import Agda.Syntax.Concrete.Pattern
 import Agda.Syntax.Position
 import Agda.Syntax.Notation
 import Agda.Syntax.Scope.Base
-import Agda.Syntax.Scope.Flat
+import Agda.Syntax.Scope.Operator
 import Agda.Syntax.Scope.Monad
 
 import Agda.TypeChecking.Monad.Base (typeError, TypeError(..), LHSOrPatSyn(..))
@@ -49,12 +52,13 @@ import qualified Agda.TypeChecking.Monad.Benchmark as Bench
 import Agda.TypeChecking.Monad.Debug
 import Agda.TypeChecking.Monad.State (getScope)
 
-import Agda.Utils.Function (applyWhen)
+import Agda.Utils.Function (applyWhen, applyWhenJust)
 import Agda.Utils.Either
 import Agda.Syntax.Common.Pretty
 import Agda.Utils.List
-import Agda.Utils.List1 (List1, pattern (:|))
+import Agda.Utils.List1 (List1, pattern (:|), (<|))
 import Agda.Utils.List2 (List2, pattern List2)
+import Agda.Utils.Null
 import qualified Agda.Utils.List1 as List1
 import qualified Agda.Utils.List2 as List2
 import Agda.Utils.Maybe
@@ -71,12 +75,9 @@ import Agda.Utils.Impossible
 -- | Bills the operator parser.
 
 billToParser :: ExprKind -> ScopeM a -> ScopeM a
-billToParser k = Bench.billTo
-  [ Bench.Parsing
-  , case k of
-      IsExpr    -> Bench.OperatorsExpr
-      IsPattern -> Bench.OperatorsPattern
-  ]
+billToParser k = Bench.billTo $! case k of
+  IsExpr      -> [Bench.Parsing, Bench.OperatorsExpr]
+  IsPattern _ -> [Bench.Parsing, Bench.OperatorsPattern]
 
 ---------------------------------------------------------------------------
 -- * Building the parser
@@ -91,26 +92,28 @@ data InternalParsers e = InternalParsers
   , pAtom   :: Parser e e
   }
 
--- | Expression kinds: Expressions or patterns.
-data ExprKind = IsExpr | IsPattern
-  deriving (Eq, Show)
-
 -- | The data returned by 'buildParsers'.
 
 data Parsers e = Parsers
-  { parser :: [e] -> [e]
+  { parser :: !([e] -> [e])
     -- ^ A parser for expressions or patterns (depending on the
     -- 'ExprKind' argument given to 'buildParsers').
-  , argsParser :: [e] -> [[NamedArg e]]
+  , argsParser :: !([e] -> [[NamedArg e]])
     -- ^ A parser for sequences of arguments.
-  , operators :: [NotationSection]
-    -- ^ All operators/notations/sections that were used to generate
+  , operators :: ![NotationSection]
+    -- ^ All operators, notations, and sections that were used to generate
     -- the grammar.
-  , flattenedScope :: FlatScope
-    -- ^ A flattened scope that only contains those names that are
-    -- unqualified or qualified by qualifiers that occur in the list
-    -- of names given to 'buildParsers'.
+    -- Only used for error reporting via 'OperatorInformation'.
+  , operatorScope :: !OperatorScope
+    -- ^ A flattened scope that only contains names such that
+    -- they occur in the expression or at least one of their
+    -- name parts occurs in the expression.
   }
+
+{-# SPECIALIZE buildParsersFromOperatorScope ::
+     ExprKind -> Maybe QName -> Set QName -> OperatorScope -> ScopeM (Parsers Expr) #-}
+{-# SPECIALIZE buildParsersFromOperatorScope ::
+     ExprKind -> Maybe QName -> Set QName -> OperatorScope -> ScopeM (Parsers Pattern) #-}
 
 -- | Builds parsers for operator applications from all the operators
 -- and function symbols in scope.
@@ -127,37 +130,27 @@ data Parsers e = Parsers
 -- sections in patterns, then we would have to accept certain such
 -- sequences of tokens as single pattern variables.
 
-buildParsers
-  :: forall e. IsExpr e
+buildParsersFromOperatorScope ::
+     forall e. IsExpr e
   => ExprKind
-     -- ^ Should expressions or patterns be parsed?
-  -> [QName]
-     -- ^ This list must include every name part in the
-     -- expression/pattern to be parsed (excluding name parts inside
-     -- things like parenthesised subexpressions that are treated as
-     -- atoms). The list is used to optimise the parser. For
-     -- instance, a given notation is only included in the generated
-     -- grammar if all of the notation's name parts are present in
-     -- the list of names.
+  -> Maybe QName
+  -> Set QName
+  -> OperatorScope
   -> ScopeM (Parsers e)
-buildParsers kind exprNames = do
-    flat         <- flattenScope (qualifierModules exprNames) <$>
-                      getScope
-    (names, ops0) <- localNames flat
-    let ops | kind == IsPattern = filter (not . isLambdaNotation) ops0
-            | otherwise         = ops0
+buildParsersFromOperatorScope kind top namesInExpr opScope = do
 
-    let -- All names.
-        namesInExpr :: Set QName
-        namesInExpr = Set.fromList exprNames
+    (names, ops0) <- localNames kind top opScope
+    let ops | isKindPattern kind = filter' (not . isLambdaNotation) ops0
+            | otherwise          = ops0
 
-        partListsInExpr' = map (List1.toList . nameParts . unqualify) $
-                           Set.toList namesInExpr
+    let
+        partListsInExpr' = map' (List1.toList . nameParts . unqualify)
+                                (Set.toList namesInExpr)
 
         partListTrie f =
-          foldr (\ps -> Trie.union (Trie.everyPrefix ps ()))
-                Trie.empty
-                (f partListsInExpr')
+          foldr' (\ps -> Trie.union (Trie.everyPrefix ps ()))
+                 Trie.empty
+                 (f partListsInExpr')
 
         -- All names.
         partListsInExpr :: Trie NamePart ()
@@ -165,18 +158,15 @@ buildParsers kind exprNames = do
 
         -- All names, with the name parts in reverse order.
         reversedPartListsInExpr :: Trie NamePart ()
-        reversedPartListsInExpr = partListTrie (map reverse)
+        reversedPartListsInExpr = partListTrie (map' reverse)
 
         -- Every regular name part (not holes etc.).
         partsInExpr :: Set RawName
         partsInExpr =
-          Set.fromList [ s | Id s <- concat partListsInExpr' ]
+          Set.fromList [ s | Id s <- concat' partListsInExpr']
 
         -- Are all name parts present in the expression?
-        partsPresent n =
-          [ Set.member p partsInExpr
-          | p <- stringParts (notation n)
-          ]
+        partsPresent n = map' (\p -> Set.member p partsInExpr) (stringParts (notation n))
 
         addHole True  p = [Hole, Id p]
         addHole False p = [Id p]
@@ -239,27 +229,31 @@ buildParsers kind exprNames = do
         -- resulting in a confusing error message claiming that "if"
         -- is not in scope.
 
-        (non, fix) = List.partition nonfix (filter (and . partsPresent) ops)
+        (non, fix) = partition' nonfix (filter' (and . partsPresent) ops)
 
+        cons       :: [List1 NewNotation]
         cons       = getDefinedNames
-                       (someKindsOfNames [ConName, CoConName, FldName, PatternSynName]) flat
+                       (someKindsOfNames [ConName, CoConName, FldName, PatternSynName]) opScope
+        conNames   :: Set QName
         conNames   = Set.fromList $
-                       filter (flip Set.member namesInExpr) $
-                       map (notaName . List1.head) cons
-        conParts   = Set.fromList $
-                       concatMap notationNames $
-                       filter (or . partsPresent) $
-                       List1.concat cons
+                       filter' (flip Set.member namesInExpr) $
+                       map' (notaName . List1.head) cons
+        conParts   :: Set QName
+        conParts   = Set.fromList $ concatMap' notationNames conPartNotations
+        conPartNotations :: [NewNotation]
+        conPartNotations = filter' (or . partsPresent) $ List1.concat' cons
 
+        allNames   :: Set QName
         allNames   = Set.fromList $
-                       filter (flip Set.member namesInExpr) names
+                       filter' (flip Set.member namesInExpr) names
+        allParts   :: Set QName
         allParts   = Set.union conParts
                        (Set.fromList $
-                        concatMap notationNames $
-                        filter (or . partsPresent) ops)
+                        concatMap' notationNames $
+                        filter' (or . partsPresent) ops)
 
         isAtom x
-          | kind == IsPattern && not (isQualified x) =
+          | isKindPattern kind && not (isQualified x) =
             not (Set.member x conParts) || Set.member x conNames
           | otherwise =
             not (Set.member x allParts) || Set.member x allNames
@@ -267,8 +261,8 @@ buildParsers kind exprNames = do
         -- unless it is also used as an identifier. See issue 307.
 
         parseSections = case kind of
-          IsPattern -> DoNotParseSections
-          IsExpr    -> ParseSections
+          IsPattern _ -> DoNotParseSections
+          IsExpr      -> ParseSections
 
     let nonClosedSections l ns =
           case parseSections of
@@ -284,16 +278,15 @@ buildParsers kind exprNames = do
         unrelatedOperators :: [NotationSection]
         unrelatedOperators =
           filterCorrectUnderscoresOp unrelated
-            ++
+            ++!
           nonClosedSections Unrelated unrelated
           where
-          unrelated = filter ((== Unrelated) . level) fix
+          unrelated = filter' ((== Unrelated) . level) fix
 
         nonWithSections :: [NotationSection]
         nonWithSections =
-          map (\s -> s { sectLevel = Nothing })
-              (filterCorrectUnderscoresOp non)
-            ++
+          map' (\s -> s { sectLevel = Nothing }) (filterCorrectUnderscoresOp non)
+            ++!
           case parseSections of
             DoNotParseSections -> []
             ParseSections      ->
@@ -307,44 +300,59 @@ buildParsers kind exprNames = do
         -- level comes first.
         relatedOperators :: [(PrecedenceLevel, [NotationSection])]
         relatedOperators =
-          map (\((l, ns) : rest) -> (l, ns ++ concatMap snd rest)) .
-          List.groupBy ((==) `on` fst) .
-          List.sortBy (compare `on` fst) .
-          mapMaybe (\n -> case level n of
+          map' (\((l, ns) :| rest) -> (l, ns ++! concatMap' snd rest)) .
+          List1.groupOn fst .
+          mapMaybe' (\n -> case level n of
                             Unrelated     -> Nothing
                             r@(Related l) ->
                               Just (l, filterCorrectUnderscoresOp [n] ++
                                        nonClosedSections r [n])) $
           fix
 
+        almostEverything :: [NotationSection]
+        almostEverything =
+          concatMap' snd relatedOperators ++!
+          unrelatedOperators ++!
+          nonWithSections
+
+        -- Andreas, 2026-02-21, issue #5839
+        -- Add constructor parts to the used-operators list,
+        -- so that failing lhs parses become more comprehensible.
+        -- Disclaimer: I don't know my way around this code,
+        -- and the expert did get active on this issue, see
+        -- https://github.com/agda/agda/issues/5839#issuecomment-1073286909
+        -- so I apologize if this is done in a non-idiomatic of clumsy fashion.
         everything :: [NotationSection]
         everything =
-          concatMap snd relatedOperators ++
-          unrelatedOperators ++
-          nonWithSections
+          almostEverything ++!
+          map' noSection (filter' ((`Set.notMember` keys) . key) conPartNotations)
+          where
+            key  = notaName
+            keys = Set.fromList $ map' (key . sectNotation) almostEverything
 
     reportS "scope.operators" 50
       [ "unrelatedOperators = " ++ prettyShow unrelatedOperators
       , "nonWithSections    = " ++ prettyShow nonWithSections
       , "relatedOperators   = " ++ prettyShow relatedOperators
+      , "conPartNotations   = " ++ prettyShow conPartNotations
       ]
 
     let g = Data.Function.fix $ \p -> InternalParsers
               { pTop    = memoise TopK $
-                          Fold.asum $
-                            foldr (\(l, ns) higher ->
-                                       mkP (Right l) parseSections
-                                           (pTop p) ns higher True) (pApp p)
+                          Agda.Utils.List.asum $
+                            foldr' (\(l, ns) higher ->
+                                        mkP (RightPK l) parseSections
+                                            (pTop p) ns higher True) (pApp p)
                                    relatedOperators :
-                            zipWith (\ k n ->
-                                    mkP (Left k) parseSections
+                            zipWith' (\ k n ->
+                                    mkP (LeftPK k) parseSections
                                         (pTop p) [n] (pApp p) False) [0..] unrelatedOperators
               , pApp    = memoise AppK $ appP (pNonfix p) (pArgs p)
               , pArgs   = argsP (pNonfix p)
               , pNonfix = memoise NonfixK $
-                          Fold.asum $
-                            pAtom p :
-                            map (\sect ->
+                          Agda.Utils.List.asum $
+                            (pAtom p :) $!
+                            map' (\sect ->
                               let n = sectNotation sect
 
                                   inner :: forall k. NK k ->
@@ -367,15 +375,15 @@ buildParsers kind exprNames = do
               }
 
     -- Andreas, 2020-06-03 #4712
-    -- Note: needs Agda to be compiled with DEBUG to print the grammar.
-    reportSDoc "scope.grammar" 10 $ return $
+    -- Note: needs Agda to be compiled with DEBUG_PARSING to print the grammar.
+    reportS "scope.grammar" 20 $
       "Operator grammar:" $$ nest 2 (grammar (pTop g))
 
     return $ Parsers
       { parser         = parse (parseSections, pTop  g)
       , argsParser     = parse (parseSections, pArgs g)
       , operators      = everything
-      , flattenedScope = flat
+      , operatorScope  = opScope
       }
     where
         level :: NewNotation -> FixityLevel
@@ -407,36 +415,66 @@ buildParsers kind exprNames = do
             -> Parser e e
         mkP key parseSections p0 ops higher includeHigher =
             memoise (NodeK key) $
-              Fold.asum $
-                applyWhen includeHigher (higher :) $
+              Agda.Utils.List.asum $
+                applyWhen includeHigher (higher :) $!
                 catMaybes [nonAssoc, preRights, postLefts]
-            where
-            choice :: forall k.
-                      NK k -> [NotationSection] ->
-                      Parser e (OperatorType k e)
-            choice k =
-              Fold.asum .
-              map (\sect ->
+          where
+            -- Andreas, 2025-02-27
+            -- Break up the choice function into its three cases,
+            -- so that matching on @k@ does not have to be performed
+            -- inside the mapped function @(\ sect -> ...)@.
+            --
+            -- choice :: forall k.
+            --           NK k -> [NotationSection] ->
+            --           Parser e (OperatorType k e)
+            -- choice k =
+            --   Agda.Utils.List.asum .
+            --   map (\sect ->
+            --     let n = sectNotation sect
+
+            --         inner :: forall k.
+            --                  NK k -> Parser e (OperatorType k e)
+            --         inner = opP parseSections p0 n
+            --     in
+            --     case k of
+            --       In   -> inner In
+
+            --       Pre  -> if isinfix n || ispostfix n
+            --               then flip ($) <$> placeholder Beginning
+            --                             <*> inner In
+            --               else inner Pre
+
+            --       Post -> if isinfix n || isprefix n
+            --               then flip <$> inner In
+            --                         <*> placeholder End
+            --               else inner Post
+
+            --       Non  -> __IMPOSSIBLE__)
+
+            choiceIn :: [NotationSection] -> Parser e (OperatorType 'InfixNotation e)
+            choiceIn =
+              Agda.Utils.List.asum .
+              map' \ sect -> opP parseSections p0 (sectNotation sect) In
+
+            choicePre :: [NotationSection] -> Parser e (OperatorType 'PrefixNotation e)
+            choicePre =
+              Agda.Utils.List.asum .
+              map' \ sect -> do
                 let n = sectNotation sect
+                if   isinfix n || ispostfix n
+                then flip ($) <$> placeholder Beginning
+                              <*> opP parseSections p0 n In
+                else opP parseSections p0 n Pre
 
-                    inner :: forall k.
-                             NK k -> Parser e (OperatorType k e)
-                    inner = opP parseSections p0 n
-                in
-                case k of
-                  In   -> inner In
-
-                  Pre  -> if isinfix n || ispostfix n
-                          then flip ($) <$> placeholder Beginning
-                                        <*> inner In
-                          else inner Pre
-
-                  Post -> if isinfix n || isprefix n
-                          then flip <$> inner In
-                                    <*> placeholder End
-                          else inner Post
-
-                  Non  -> __IMPOSSIBLE__)
+            choicePost :: [NotationSection] -> Parser e (OperatorType 'PostfixNotation e)
+            choicePost =
+              Agda.Utils.List.asum .
+              map' \ sect -> do
+                let n = sectNotation sect
+                if isinfix n || isprefix n
+                then flip <$> opP parseSections p0 n In
+                          <*> placeholder End
+                else opP parseSections p0 n Post
 
             nonAssoc :: Maybe (Parser e e)
             nonAssoc = case filter (isInfix NonAssoc) ops of
@@ -444,21 +482,21 @@ buildParsers kind exprNames = do
               ops -> Just $
                 (\x f y -> f (noPlaceholder x) (noPlaceholder y))
                   <$> higher
-                  <*> choice In ops
+                  <*> choiceIn ops
                   <*> higher
 
-            or p1 []   p2 []   = Nothing
-            or p1 []   p2 ops2 = Just (p2 ops2)
-            or p1 ops1 p2 []   = Just (p1 ops1)
+            or _  []   _  []   = Nothing
+            or _  []   p2 ops2 = Just (p2 ops2)
+            or p1 ops1 _  []   = Just (p1 ops1)
             or p1 ops1 p2 ops2 = Just (p1 ops1 <|> p2 ops2)
 
             preRight :: Maybe (Parser e (MaybePlaceholder e -> e))
             preRight =
-              or (choice Pre)
-                 (filter isPrefix ops)
+              or choicePre
+                 (filter' isPrefix ops)
                  (\ops -> flip ($) <$> (noPlaceholder <$> higher)
-                                   <*> choice In ops)
-                 (filter (isInfix RightAssoc) ops)
+                                   <*> choiceIn ops)
+                 (filter' (isInfix RightAssoc) ops)
 
             preRights :: Maybe (Parser e e)
             preRights = do
@@ -469,11 +507,11 @@ buildParsers kind exprNames = do
 
             postLeft :: Maybe (Parser e (MaybePlaceholder e -> e))
             postLeft =
-              or (choice Post)
+              or choicePost
                  (filter isPostfix ops)
-                 (\ops -> flip <$> choice In ops
+                 (\ops -> flip <$> choiceIn ops
                                <*> (noPlaceholder <$> higher))
-                 (filter (isInfix LeftAssoc) ops)
+                 (filter' (isInfix LeftAssoc) ops)
 
             postLefts :: Maybe (Parser e e)
             postLefts = do
@@ -483,36 +521,88 @@ buildParsers kind exprNames = do
                   flip ($) <$> (noPlaceholder <$> (postLefts <|> higher))
                            <*> postLeft
 
+-- | Only build parsers if there's at least one relevant operator or notation in
+--   scope.
+buildParsers ::
+        forall e. IsExpr e
+     => ExprKind
+     -- ^ Should expressions or patterns be parsed?
+     -> Maybe QName
+     -- ^ Are we trying to parse the lhs of the function given here?
+     -> [QName]
+     -- ^ This list must include every name part in the
+     -- expression/pattern to be parsed (excluding name parts inside
+     -- things like parenthesised subexpressions that are treated as
+     -- atoms). The list is used to optimise the parser. For
+     -- instance, a given notation is only included in the generated
+     -- grammar if all of the notation's name parts are present in
+     -- the list of names.
+     -> ScopeM (Maybe (Parsers e))
+buildParsers kind top exprNames0 = do
+    let namesInExpr = Set.fromList $ applyWhenJust top (:) exprNames0
+    opScope <- getOperatorScope namesInExpr <$> getScope
+    if osHasOps opScope
+      then Just <$!> buildParsersFromOperatorScope kind top namesInExpr opScope
+      else pure Nothing
+
+-- | Build parsers regardless of there being operators or notations in the relevant scope.
+alwaysBuildParsers ::
+        forall e. IsExpr e
+     => ExprKind
+     -- ^ Should expressions or patterns be parsed?
+     -> Maybe QName
+     -- ^ Are we trying to parse the lhs of the function given here?
+     -> [QName]
+     -- ^ This list must include every name part in the
+     -- expression/pattern to be parsed (excluding name parts inside
+     -- things like parenthesised subexpressions that are treated as
+     -- atoms). The list is used to optimise the parser. For
+     -- instance, a given notation is only included in the generated
+     -- grammar if all of the notation's name parts are present in
+     -- the list of names.
+     -> ScopeM (Parsers e)
+alwaysBuildParsers kind top exprNames0 = do
+    let namesInExpr = Set.fromList $ applyWhenJust top (:) exprNames0
+    opScope <- getOperatorScope namesInExpr <$> getScope
+    buildParsersFromOperatorScope kind top namesInExpr opScope
 
 ---------------------------------------------------------------------------
 -- * Parse functions
 ---------------------------------------------------------------------------
 
--- | Returns the list of possible parses.
+-- | Parses all 'RawAppP' in the given pattern using the given parser.
+--   Returns the list of possible parses.
+--
+--   Naturally, does not recurse into 'DotP' as this contains no pattern.
+--
+--   Returns the empty list if the given parser does so
+--   or if a 'HiddenP' or 'InstanceP' is encountered.
 parsePat
   :: ([Pattern] -> [Pattern]) -- ^ Turns a 'RawAppP' into possible parses.
   -> Pattern                  -- ^ Pattern possibly containing 'RawAppP's.
   -> [Pattern]                -- ^ Possible parses, not containing 'RawAppP's.
-parsePat prs = \case
+parsePat parse = loop
+  where
+  loop = \case
     AppP p (Arg info q) ->
-        fullParen' <$> (AppP <$> parsePat prs p <*> (Arg info <$> traverse (parsePat prs) q))
-    RawAppP _ ps     -> fullParen' <$> (parsePat prs =<< prs (List2.toList ps))
-    OpAppP r d ns ps -> fullParen' . OpAppP r d ns <$> (mapM . traverse . traverse) (parsePat prs) ps
+        fullParen' <$> (AppP <$> loop p <*> (Arg info <$> traverse loop q))
+    RawAppP _ ps     -> fullParen' <$> (loop =<< parse (List2.toList ps))
+    OpAppP r d ns ps -> fullParen' . OpAppP r d ns <$> (mapM . traverse . traverse) loop ps
     HiddenP _ _      -> fail "bad hidden argument"
     InstanceP _ _    -> fail "bad instance argument"
-    AsP r x p        -> AsP r x <$> parsePat prs p
+    AsP r x p        -> AsP r x <$> loop p
     p@DotP{}         -> return p
-    ParenP r p       -> fullParen' <$> parsePat prs p
+    ParenP _r p      -> fullParen' <$> loop p
     p@WildP{}        -> return p
     p@AbsurdP{}      -> return p
     p@LitP{}         -> return p
     p@QuoteP{}       -> return p
     p@IdentP{}       -> return p
-    RecP r fs        -> RecP r <$> mapM (traverse (parsePat prs)) fs
+    RecP kwr r fs    -> RecP kwr r <$> mapM (traverse loop) fs
     p@EqualP{}       -> return p -- Andrea: cargo culted from DotP
     EllipsisP r mp   -> caseMaybe mp (fail "bad ellipsis") $ \p ->
-                          EllipsisP r . Just <$> parsePat prs p
-    WithP r p        -> WithP r <$> parsePat prs p
+                          EllipsisP r . Just <$> loop p
+    WithP r p        -> WithP r <$> loop p
 
 
 {- Implement parsing of copattern left hand sides, e.g.
@@ -563,8 +653,13 @@ instance Pretty ParseLHS where
 
 -- | Parses a left-hand side, workhorse for 'parseLHS'.
 --
-parseLHS'
-  :: LHSOrPatSyn
+parseLHS' ::
+     DisplayLHS
+       -- ^ Are we parsing a 'DisplayPragma'?
+       --   Then defined names are recognized as constructors.
+       --
+       --   In this case, 'LHSOrPatSyn' is 'IsLHS' and 'Maybe QName' is 'Just'.
+  -> LHSOrPatSyn
        -- ^ Are we trying to parse a lhs or a pattern synonym?
        --   For error reporting only!
   -> Maybe QName
@@ -572,46 +667,46 @@ parseLHS'
        --   'Nothing' if we parse a pattern.
   -> Pattern
        -- ^ Thing to parse.
-  -> ScopeM (ParseLHS, [NotationSection])
-       -- ^ The returned list contains all operators/notations/sections that
-       -- were used to generate the grammar.
+  -> ScopeM (ParseLHS, [NotationSection], OperatorScope)
+       -- ^ The returned list contains all operators\/notations\/sections that
+       --   were used to generate the grammar.
 
-parseLHS' IsLHS (Just qn) WildP{} =
-    return (ParseLHS qn $ LHSHead qn [], [])
+parseLHS' NoDisplayLHS IsLHS (Just qn) WildP{} =
+    return (ParseLHS qn $ LHSHead qn [], [], empty)
 
-parseLHS' lhsOrPatSyn top p = do
+parseLHS' displayLhs lhsOrPatSyn top p = do
 
     -- Build parser.
-    patP <- buildParsers IsPattern (patternQNames p)
+    patP <- alwaysBuildParsers (IsPattern displayLhs) top (patternQNames p)
 
     -- Run parser, forcing result.
     let ps   = let result = parsePat (parser patP) p
-               in  foldr seq () result `seq` result
+               in  foldr' seq () result `seq` result
 
     -- Classify parse results.
-    let cons = getNames (someKindsOfNames [ConName, CoConName, PatternSynName])
-                        (flattenedScope patP)
+    let cons = getNames (someKindsOfNames $ applyWhen displayLhs (defNameKinds ++) conLikeNameKinds)
+                        (operatorScope patP)
     let flds = getNames (someKindsOfNames [FldName])
-                        (flattenedScope patP)
+                        (operatorScope patP)
     let conf = PatternCheckConfig top (hasElem cons) (hasElem flds)
 
-    let (errs, results) = partitionEithers $ map (validPattern conf) ps
+    let (errs, results) = partitionEithers' $ map' (validPattern conf) ps
     reportS "scope.operators" 60 $ vcat $
       [ "Possible parses for lhs:" ] ++ map (nest 2 . pretty . snd) results
     case results of
         -- Unique result.
-        [(_,lhs)] -> do reportS "scope.operators" 50 $ "Parsed lhs:" <+> pretty lhs
-                        return (lhs, operators patP)
+        [(_,lhs)] -> (lhs, operators patP, operatorScope patP) <$ do
+                       reportS "scope.operators" 50 $ "Parsed lhs:" <+> pretty lhs
         -- No result.
-        []        -> typeError $ OperatorInformation (operators patP)
-                               $ NoParseForLHS lhsOrPatSyn (catMaybes errs) p
+        []        -> typeError $ OperatorInformation (operators patP) (operatorScope patP) $
+                       NoParseForLHS lhsOrPatSyn (catMaybes errs) p
         -- Ambiguous result.
-        rs        -> typeError $ OperatorInformation (operators patP)
-                               $ AmbiguousParseForLHS lhsOrPatSyn p $
-                       map (fullParen . fst) rs
+        r0:r1:rs  -> typeError $ OperatorInformation (operators patP) (operatorScope patP) $
+                       AmbiguousParseForLHS lhsOrPatSyn p $
+                         fmap (fullParen . fst) $ List2 r0 r1 rs
     where
         getNames kinds flat =
-          map (notaName . List1.head) $ getDefinedNames kinds flat
+          map' (notaName . List1.head) $ getDefinedNames kinds flat
 
         -- The pattern is retained for error reporting in case of ambiguous parses.
         validPattern :: PatternCheckConfig -> Pattern -> PM (Pattern, ParseLHS)
@@ -692,12 +787,19 @@ classifyPattern conf p =
 
 
 -- | Parses a left-hand side, and makes sure that it defined the expected name.
-parseLHS :: QName -> Pattern -> ScopeM LHSCore
-parseLHS top p = billToParser IsPattern $ do
-  (res, ops) <- parseLHS' IsLHS (Just top) p
+parseLHS ::
+     DisplayLHS
+       -- ^ Are we parsing a 'DisplayPragma'?
+  -> QName
+       -- ^ Name of the definition.
+  -> Pattern
+       -- ^ Full left hand side.
+  -> ScopeM LHSCore
+parseLHS displayLhs top p = billToParser (IsPattern displayLhs) $ do
+  (res, ops, opScope) <- parseLHS' displayLhs IsLHS (Just top) p
   case res of
-    ParseLHS f lhs -> return lhs
-    _ -> typeError $ OperatorInformation ops
+    ParseLHS _f lhs -> return lhs
+    _ -> typeError $ OperatorInformation ops opScope
                    $ NoParseForLHS IsLHS [] p
 
 -- | Parses a pattern.
@@ -708,11 +810,11 @@ parsePatternSyn :: Pattern -> ScopeM Pattern
 parsePatternSyn = parsePatternOrSyn IsPatSyn
 
 parsePatternOrSyn :: LHSOrPatSyn -> Pattern -> ScopeM Pattern
-parsePatternOrSyn lhsOrPatSyn p = billToParser IsPattern $ do
-  (res, ops) <- parseLHS' lhsOrPatSyn Nothing p
+parsePatternOrSyn lhsOrPatSyn p = billToParser (IsPattern NoDisplayLHS) $ do
+  (res, ops, opScope) <- parseLHS' NoDisplayLHS lhsOrPatSyn Nothing p
   case res of
     ParsePattern p -> return p
-    _ -> typeError $ OperatorInformation ops
+    _ -> typeError $ OperatorInformation ops opScope
                    $ NoParseForLHS lhsOrPatSyn [] p
 
 -- | Helper function for 'parseLHS' and 'parsePattern'.
@@ -726,14 +828,34 @@ validConPattern
 validConPattern cons = loop
   where
   loop p = case appView p of
-      WithP _ p :| [] -> loop p
-      _ :| []         -> ok
-      IdentP _ x :| ps
-        | cons x      -> mapM_ loop ps
-        | otherwise   -> failure
-      QuoteP _ :| [_] -> ok
-      DotP _ e :| ps  -> mapM_ loop ps
-      _               -> failure
+
+      -- Eliminated by appView:
+      AppP{}      :| _   -> __IMPOSSIBLE__
+      OpAppP{}    :| _   -> __IMPOSSIBLE__
+      ParenP{}    :| _   -> __IMPOSSIBLE__
+      RawAppP{}   :| _   -> __IMPOSSIBLE__
+      HiddenP{}   :| _   -> __IMPOSSIBLE__
+      InstanceP{} :| _   -> __IMPOSSIBLE__
+
+      -- Hopeful cases:
+      WithP _ p   :| []  -> loop p
+      _           :| []  -> ok
+      IdentP _ x  :| ps
+        | cons x         -> mapM_ loop ps
+        | otherwise      -> failure
+      QuoteP _    :| [_] -> ok
+      DotP _ _ _ _ :| ps -> mapM_ loop ps
+
+      -- Failures:
+      AbsurdP{}   :| _:_ -> failure
+      AsP{}       :| _:_ -> failure
+      EllipsisP{} :| _:_ -> failure
+      EqualP{}    :| _:_ -> failure
+      LitP{}      :| _:_ -> failure
+      QuoteP{}    :| _:_ -> failure
+      RecP{}      :| _:_ -> failure
+      WildP{}     :| _:_ -> failure
+      WithP{}     :| _:_ -> failure
     where
     ok      = return ()
     failure = throwError $ Just p
@@ -745,7 +867,7 @@ appView = loop []
   where
   loop acc = \case
     AppP p a         -> loop (namedArg a : acc) p
-    OpAppP _ op _ ps -> (IdentP True op :| fmap namedArg ps)
+    OpAppP _ op _ ps -> (IdentP True op <| fmap namedArg ps)
                           `List1.appendList`
                         reverse acc
     ParenP _ p       -> loop acc p
@@ -766,67 +888,70 @@ appView = loop []
    where
    ret p = p :| reverse acc
 
--- | Return all qualifiers occuring in a list of 'QName's.
---   Each qualifier is returned as a list of names, e.g.
---   for @Data.Nat._+_@ we return the list @[Data,Nat]@.
-qualifierModules :: [QName] -> [[Name]]
-qualifierModules qs =
-  nubOn id $ filter (not . null) $ map (List1.init . qnameParts) qs
-
 -- | Parse a list of expressions (typically from a 'RawApp') into an application.
 parseApplication :: List2 Expr -> ScopeM Expr
 parseApplication es  = billToParser IsExpr $ do
     let es0 = List2.toList es
-    -- Build the parser
-    p <- buildParsers IsExpr [ q | Ident q <- es0 ]
+    p <- buildParsers IsExpr Nothing [ q | Ident q <- es0 ]
+    case p of
 
-    -- Parse
-    let result = parser p es0
-    case foldr seq () result `seq` result of
-      [e]   -> do
-          reportSDoc "scope.operators" 50 $ return $
-            "Parsed an operator application:" <+> pretty e
-          return e
-      []    -> typeError $ OperatorInformation (operators p)
-                         $ NoParseForApplication es
-      e:es' -> typeError $ OperatorInformation (operators p)
-                         $ AmbiguousParseForApplication es
-                         $ fmap fullParen (e :| es')
+      -- no operators or notations in scope
+      Nothing -> do
+        let hd :| rest = List2.toList1 es
+            app :: Expr -> Expr -> Expr
+            app !acc !e = let
+              range = fuseRange acc e
+              !arg  = case e of
+                HiddenArg _ e    -> hide (defaultArg e)
+                InstanceArg _ e  -> makeInstance (defaultArg e)
+                e                -> defaultArg (unnamed e)
+              in App range acc arg
+            !res = foldl' app hd rest
+        pure res
 
-parseModuleIdentifier :: Expr -> ScopeM QName
-parseModuleIdentifier (Ident m) = return m
-parseModuleIdentifier e = typeError $ NotAModuleExpr e
+      -- operators or notations in scope
+      Just p -> case parser p es0 of
+        [e]   -> do
+            reportS "scope.operators" 50 $
+              "Parsed an operator application:" <+> pretty e
+            return $! e
+        []    -> typeError $ OperatorInformation (operators p) (operatorScope p)
+                           $ NoParseForApplication es
+        e:es' -> typeError $ OperatorInformation (operators p) (operatorScope p)
+                           $ AmbiguousParseForApplication es
+                           $ fmap fullParen (e :| es')
 
-parseRawModuleApplication :: List2 Expr -> ScopeM (QName, [NamedArg Expr])
-parseRawModuleApplication es@(List2 e e2 rest) = billToParser IsExpr $ do
-    let es_args = e2:rest
-    m <- parseModuleIdentifier e
+-- | Parse the arguments of a raw application with known head.
+--
+parseArguments ::
+     Expr                   -- ^ Head
+  -> [Expr]                 -- ^ Raw arguments
+  -> ScopeM [NamedArg Expr] -- ^ Operator-parsed arguments
+parseArguments hd = \case
+  [] -> return []
+  es@(e1 : rest) -> billToParser IsExpr $ do
+
+    -- Form the raw application for error reporting
+    let es2 = List2 hd e1 rest
 
     -- Build the arguments parser
-    p <- buildParsers IsExpr [ q | Ident q <- es_args ]
-
-    -- Parse
-    -- TODO: not sure about forcing
-    case {-force $-} argsParser p es_args of
-        [as] -> return (m, as)
-        []   -> typeError $ OperatorInformation (operators p)
-                          $ NoParseForApplication es
+    p <- buildParsers IsExpr Nothing [ q | Ident q <- es ]
+    case p of
+      Nothing -> do
+        let go :: Expr -> NamedArg Expr
+            go (HiddenArg _ e)   = hide (defaultArg e)
+            go (InstanceArg _ e) = makeInstance (defaultArg e)
+            go e                 = defaultArg (unnamed e)
+        return $! map' go es
+      Just p -> case argsParser p es of
+        [as] -> return $! as
+        []   -> typeError $ OperatorInformation (operators p) (operatorScope p)
+                          $ NoParseForApplication es2
         as : ass -> do
-          let f = fullParen . foldl (App noRange) (Ident m)
-          typeError $ OperatorInformation (operators p)
-                    $ AmbiguousParseForApplication es
+          let f = fullParen . foldl' (App noRange) hd
+          typeError $ OperatorInformation (operators p) (operatorScope p)
+                    $ AmbiguousParseForApplication es2
                     $ fmap f (as :| ass)
-
--- | Parse an expression into a module application
---   (an identifier plus a list of arguments).
-parseModuleApplication :: Expr -> ScopeM (QName, [NamedArg Expr])
-parseModuleApplication (RawApp _ es) = parseRawModuleApplication es
-parseModuleApplication (App r e1 e2) = do -- TODO: do we need this case?
-    (m, args) <- parseModuleApplication e1
-    return (m, args ++ [e2])
-parseModuleApplication e = do
-    m <- parseModuleIdentifier e
-    return (m, [])
 
 ---------------------------------------------------------------------------
 -- * Inserting parenthesis

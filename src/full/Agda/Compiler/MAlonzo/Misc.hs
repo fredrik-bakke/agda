@@ -1,7 +1,5 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-{-# LANGUAGE CPP #-}
-
 module Agda.Compiler.MAlonzo.Misc where
 
 import Control.Monad.Reader ( ask )
@@ -19,10 +17,6 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 
-#if !(MIN_VERSION_base(4,11,0))
-import Data.Semigroup
-#endif
-
 import qualified Agda.Utils.Haskell.Syntax as HS
 
 import Agda.Compiler.Common as CC
@@ -35,6 +29,7 @@ import Agda.TypeChecking.Monad
 
 import Agda.Syntax.Common.Pretty
 
+import Agda.Utils.CallStack ( HasCallStack )
 import Agda.Utils.Impossible
 
 --------------------------------------------------
@@ -63,6 +58,8 @@ data GHCOptions = GHCOptions
     -- ^ Make inductive constructors strict?
   , optGhcStrict :: Bool
     -- ^ Make functions strict?
+  , optGhcTrace :: Bool
+    -- ^ Print function name upon entry using 'Debug.Trace.trace'?
   }
 
 -- | A static part of the GHC backend's environment that does not
@@ -96,8 +93,6 @@ data GHCEnv = GHCEnv
   , ghcEnvPathP
   , ghcEnvSub
   , ghcEnvSubIn
-  , ghcEnvId
-  , ghcEnvConId
     :: Maybe QName
     -- Various (possibly) builtin names.
   , ghcEnvIsTCBuiltin :: QName -> Bool
@@ -118,7 +113,7 @@ class Monad m => ReadGHCModuleEnv m where
   askGHCModuleEnv :: m GHCModuleEnv
 
   default askGHCModuleEnv
-    :: (MonadTrans t, Monad n, m ~ (t n), ReadGHCModuleEnv n)
+    :: (MonadTrans t, m ~ (t n), ReadGHCModuleEnv n)
     => m GHCModuleEnv
   askGHCModuleEnv = lift askGHCModuleEnv
 
@@ -151,6 +146,9 @@ runHsCompileT' t e s = (flip runStateT s) . (flip runReaderT e) $ t
 
 runHsCompileT :: HsCompileT m a -> GHCModuleEnv -> m (a, HsCompileState)
 runHsCompileT t e = runHsCompileT' t e mempty
+
+ghcBackendError :: (HasCallStack, MonadTCError m) => GHCBackendError -> m a
+ghcBackendError = locatedTypeError GHCBackendError
 
 --------------------------------------------------
 -- utilities for haskell names

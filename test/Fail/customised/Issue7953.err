@@ -1,0 +1,2 @@
+customised/Issue7953/Test.agda:1.1-27: error: [IllegalDeclarationBeforeTopLevelModule]
+Illegal declaration(s) before top-level module
